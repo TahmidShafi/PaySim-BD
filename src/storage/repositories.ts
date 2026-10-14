@@ -41,25 +41,56 @@ export interface EventRecord {
   chaos_applied?: string | null;
 }
 
+export interface OutboxItemParam {
+  sns_message_id: string;
+  sns_type: string;
+  payload: string;
+  signature: string;
+  next_attempt_at: number;
+}
+
+export interface TokenRecord {
+  id_token: string;
+  refresh_token: string;
+  issued_at: number;
+  id_expires_at: number;
+  refresh_expires_at: number;
+  revoked?: number;
+}
+
 export interface AtomicExecutePaymentParams {
   paymentId: string;
   expectedStatus?: string; // default: 'APPROVED'
   newStatus: string;       // default: 'COMPLETED'
   trxId: string;
   updatedAt: number;
-  outbox: {
-    sns_message_id: string;
-    sns_type: string;
-    payload: string;
-    signature: string;
-    next_attempt_at: number;
-  };
+  outbox: OutboxItemParam | OutboxItemParam[];
   event?: {
     kind: string;
     request?: string;
     response?: string;
     chaos_applied?: string;
   };
+}
+
+export function insertToken(db: DatabaseType, token: TokenRecord): void {
+  const stmt = db.prepare(`
+    INSERT INTO tokens (id_token, refresh_token, issued_at, id_expires_at, refresh_expires_at, revoked)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    token.id_token,
+    token.refresh_token,
+    token.issued_at,
+    token.id_expires_at,
+    token.refresh_expires_at,
+    token.revoked ?? 0
+  );
+}
+
+export function getTokenById(db: DatabaseType, idToken: string): TokenRecord | undefined {
+  const stmt = db.prepare('SELECT * FROM tokens WHERE id_token = ?');
+  return stmt.get(idToken) as TokenRecord | undefined;
 }
 
 export function insertPayment(db: DatabaseType, payment: PaymentRecord): void {
@@ -114,7 +145,7 @@ export function updatePaymentStatus(
 
 /**
  * Atomically transitions a payment from APPROVED to COMPLETED with its trx_id,
- * and enqueues an ipn_outbox record inside a synchronous BEGIN IMMEDIATE transaction.
+ * and enqueues ipn_outbox record(s) inside a synchronous BEGIN IMMEDIATE transaction.
  *
  * Invariant 4:
  * State transitions and outbox insertions MUST happen inside a single synchronous
@@ -159,14 +190,18 @@ export function atomicExecutePaymentWithOutbox(
         ?, ?, ?, ?, ?, 0, ?, 0, 'PENDING'
       )
     `);
-    outboxStmt.run(
-      params.paymentId,
-      params.outbox.sns_message_id,
-      params.outbox.sns_type,
-      params.outbox.payload,
-      params.outbox.signature,
-      params.outbox.next_attempt_at
-    );
+
+    const outboxItems = Array.isArray(params.outbox) ? params.outbox : [params.outbox];
+    for (const item of outboxItems) {
+      outboxStmt.run(
+        params.paymentId,
+        item.sns_message_id,
+        item.sns_type,
+        item.payload,
+        item.signature,
+        item.next_attempt_at
+      );
+    }
 
     if (params.event) {
       const eventStmt = db.prepare(`
