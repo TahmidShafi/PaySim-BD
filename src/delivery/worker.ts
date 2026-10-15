@@ -1,24 +1,20 @@
 import { EventEmitter } from 'node:events';
 import { type Database as DatabaseType } from 'better-sqlite3';
 import { type Clock } from '../core/clock.js';
+import {
+  claimDueOutboxRows,
+  markOutboxDelivered,
+  markOutboxRetry,
+  type ClaimedOutboxRow
+} from '../storage/repositories.js';
 
 export interface OutboxWorkerOptions {
   db: DatabaseType;
   clock: Clock;
   eventEmitter?: EventEmitter;
   pollIntervalMs?: number;
-}
-
-export interface DueOutboxRow {
-  id: number;
-  payment_id: string;
-  sns_message_id: string;
-  sns_type: string;
-  payload: string;
-  signature: string;
-  attempts: number;
-  callback_url: string;
-  next_attempt_at: number;
+  leaseDurationMs?: number; // default 30000 (30s)
+  maxAttempts?: number;     // default 5
 }
 
 export class OutboxWorker {
@@ -26,6 +22,8 @@ export class OutboxWorker {
   private clock: Clock;
   private eventEmitter?: EventEmitter;
   private pollIntervalMs: number;
+  private leaseDurationMs: number;
+  private maxAttempts: number;
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
   private isProcessing = false;
@@ -36,6 +34,8 @@ export class OutboxWorker {
     this.clock = options.clock;
     this.eventEmitter = options.eventEmitter;
     this.pollIntervalMs = options.pollIntervalMs ?? 100;
+    this.leaseDurationMs = options.leaseDurationMs ?? 30000;
+    this.maxAttempts = options.maxAttempts ?? 5;
 
     this.wakeListener = () => {
       void this.processDueRows();
@@ -69,9 +69,8 @@ export class OutboxWorker {
   }
 
   /**
-   * Reads all due PENDING outbox items and dispatches them via Promise.all.
-   * If multiple rows are due at the same timestamp (e.g. interval_ms = 0),
-   * they fire concurrently.
+   * Claims all due PENDING or RETRY outbox items inside a synchronous SQLite immediate transaction
+   * (setting 30s locked_until lease and incrementing attempts), then dispatches them concurrently via Promise.all.
    */
   async processDueRows(): Promise<number> {
     if (this.isProcessing) return 0;
@@ -79,50 +78,25 @@ export class OutboxWorker {
 
     try {
       const now = this.clock.nowMs();
-      const stmt = this.db.prepare(`
-        SELECT o.id, o.payment_id, o.sns_message_id, o.sns_type, o.payload, o.signature,
-               o.attempts, o.next_attempt_at, p.callback_url
-        FROM ipn_outbox o
-        JOIN payments p ON o.payment_id = p.payment_id
-        WHERE o.status = 'PENDING'
-          AND o.next_attempt_at <= ?
-        ORDER BY o.next_attempt_at ASC, o.id ASC
-      `);
-
-      const dueRows = stmt.all(now) as DueOutboxRow[];
-      if (dueRows.length === 0) {
+      const claimedRows = claimDueOutboxRows(this.db, now, this.leaseDurationMs);
+      if (claimedRows.length === 0) {
         return 0;
       }
 
-      // Mark all due rows as in-flight / PROCESSING to avoid double selection in overlapping polls
-      const markStmt = this.db.prepare(`
-        UPDATE ipn_outbox
-        SET status = 'PROCESSING'
-        WHERE id = ? AND status = 'PENDING'
-      `);
-
-      const validRows: DueOutboxRow[] = [];
-      for (const row of dueRows) {
-        const res = markStmt.run(row.id);
-        if (res.changes === 1) {
-          validRows.push(row);
-        }
-      }
-
-      // Dispatch all valid due rows concurrently using Promise.all
+      // Dispatch all claimed rows concurrently using Promise.all
       await Promise.all(
-        validRows.map(async (row) => {
+        claimedRows.map(async (row) => {
           await this.dispatchRow(row);
         })
       );
 
-      return validRows.length;
+      return claimedRows.length;
     } finally {
       this.isProcessing = false;
     }
   }
 
-  private async dispatchRow(row: DueOutboxRow): Promise<void> {
+  private async dispatchRow(row: ClaimedOutboxRow): Promise<void> {
     try {
       const res = await fetch(row.callback_url, {
         method: 'POST',
@@ -134,29 +108,22 @@ export class OutboxWorker {
         body: row.payload
       });
 
-      const isDelivered = res.ok;
-      this.db
-        .prepare(`
-          UPDATE ipn_outbox
-          SET attempts = attempts + 1,
-              last_http_status = ?,
-              status = ?,
-              last_error = NULL
-          WHERE id = ?
-        `)
-        .run(res.status, isDelivered ? 'DELIVERED' : 'FAILED', row.id);
+      if (res.ok) {
+        markOutboxDelivered(this.db, row.id, res.status);
+      } else {
+        const errorText = await res.text().catch(() => '');
+        const errorMsg = `HTTP ${res.status}: ${errorText.slice(0, 200)}`;
+        const delayMs = Math.min(60000, 1000 * Math.pow(2, row.attempts - 1));
+        const isDead = row.attempts >= this.maxAttempts;
+        const nextAttemptAt = this.clock.nowMs() + delayMs;
+        markOutboxRetry(this.db, row.id, nextAttemptAt, errorMsg, isDead, res.status);
+      }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      this.db
-        .prepare(`
-          UPDATE ipn_outbox
-          SET attempts = attempts + 1,
-              last_http_status = NULL,
-              status = 'FAILED',
-              last_error = ?
-          WHERE id = ?
-        `)
-        .run(errMsg, row.id);
+      const delayMs = Math.min(60000, 1000 * Math.pow(2, row.attempts - 1));
+      const isDead = row.attempts >= this.maxAttempts;
+      const nextAttemptAt = this.clock.nowMs() + delayMs;
+      markOutboxRetry(this.db, row.id, nextAttemptAt, errMsg, isDead, null);
     }
   }
 }

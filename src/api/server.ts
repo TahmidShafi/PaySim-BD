@@ -15,9 +15,16 @@ import {
   getTokenByRefreshToken,
   insertEvent,
   atomicExecutePaymentWithOutbox,
+  insertWebhookSubscription,
+  confirmWebhookSubscription,
   type PaymentRecord
 } from '../storage/repositories.js';
 import { buildOutboxItems, type DuplicateChaosRule } from '../chaos/duplicate.js';
+import {
+  loadDefaultTestCertificate,
+  createSignedNotificationEnvelope,
+  createSignedSubscriptionConfirmationEnvelope
+} from '../delivery/sns-signer.js';
 
 export interface SimulatorServerOptions {
   db: DatabaseType;
@@ -57,6 +64,10 @@ const AdvanceClockSchema = z.object({
   ms: z.number().optional()
 });
 
+const RegisterWebhookSchema = z.object({
+  targetUrl: z.string().url()
+});
+
 let trxSequence = 0;
 
 /**
@@ -81,6 +92,12 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   // Optional chaos rule toggle at runtime
   app.decorate('setChaosRule', (rule: DuplicateChaosRule | null) => {
     activeChaosRule = rule;
+  });
+
+  // Serve public X.509 certificate for SNS signature verification
+  app.get('/.well-known/paysim-sns.pem', async (_req, reply) => {
+    const cert = loadDefaultTestCertificate();
+    return reply.header('Content-Type', 'application/x-pem-file').send(cert);
   });
 
   // Token authentication helper
@@ -295,7 +312,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
 
       insertPayment(db, paymentRecord);
 
-      const host = req.headers.host ?? 'localhost';
+      const host = req.headers.host ?? '127.0.0.1';
       const bkashURL = `http://${host}/_paysim/checkout/${paymentId}`;
 
       // Support Headless CI Auto-Approve on /create
@@ -413,26 +430,32 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
         transactionStatus: 'Completed',
         merchantInvoiceNumber: payment.invoice,
         paymentID: payment.payment_id,
-        payerReference: payment.payer_reference
+        payerReference: payment.payer_reference,
+        transactionType: payment.intent
       });
 
-      // Construct AWS SNS Notification envelope
-      const snsEnvelope = JSON.stringify({
-        Type: 'Notification',
-        MessageId: crypto.randomUUID(),
-        TopicArn: 'arn:aws:sns:ap-southeast-1:000000000000:bkash-ipn',
-        Subject: 'bKash Payment Notification',
-        Message: innerMessage,
-        Timestamp: clock.nowIso(),
-        SignatureVersion: '1',
-        Signature: 'mock-signature-milestone1',
-        SigningCertURL: 'https://sns.ap-southeast-1.amazonaws.com/SimpleNotificationService-mock.pem'
-      });
+      const host = req.headers.host ?? '127.0.0.1';
+      const signingCertUrl = `http://${host}/.well-known/paysim-sns.pem`;
+
+      // Construct signed AWS SNS Notification envelope (SignatureVersion: 1, RSA-SHA1)
+      const signedNotification = createSignedNotificationEnvelope(
+        {
+          Type: 'Notification',
+          MessageId: crypto.randomUUID(),
+          TopicArn: 'arn:aws:sns:ap-southeast-1:000000000000:bkash-ipn',
+          Subject: 'bKash Payment Notification',
+          Message: innerMessage,
+          Timestamp: clock.nowIso()
+        },
+        signingCertUrl
+      );
+
+      const snsEnvelope = JSON.stringify(signedNotification);
 
       // Apply duplicate chaos rule if configured
       const outboxItems = buildOutboxItems({
         basePayload: snsEnvelope,
-        signature: 'mock-signature-milestone1',
+        signature: signedNotification.Signature,
         snsType: 'Notification',
         nowMs: now,
         chaosRule: activeChaosRule
@@ -509,6 +532,89 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       });
     }
   );
+
+  // 8. POST /_paysim/webhooks/register (AWS SNS SubscriptionConfirmation Handshake)
+  app.post('/_paysim/webhooks/register', async (req, reply) => {
+    const parseResult = RegisterWebhookSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(400).send({ error: 'Invalid targetUrl' });
+    }
+
+    const { targetUrl } = parseResult.data;
+    const token = crypto.randomUUID().replace(/-/g, '');
+    const topicArn = 'arn:aws:sns:ap-southeast-1:000000000000:bkash-ipn';
+    const host = req.headers.host ?? '127.0.0.1';
+    const subscribeUrl = `http://${host}/_paysim/sns/confirm?token=${token}`;
+    const signingCertUrl = `http://${host}/.well-known/paysim-sns.pem`;
+
+    insertWebhookSubscription(db, {
+      target_url: targetUrl,
+      status: 'PENDING_CONFIRMATION',
+      token,
+      topic_arn: topicArn,
+      confirmed_at: null
+    });
+
+    const message = `You have chosen to subscribe to the topic ${topicArn}.\nTo confirm the subscription, visit the SubscribeURL included in this message.`;
+
+    const confirmationEnvelope = createSignedSubscriptionConfirmationEnvelope(
+      {
+        Type: 'SubscriptionConfirmation',
+        MessageId: crypto.randomUUID(),
+        Token: token,
+        TopicArn: topicArn,
+        Message: message,
+        SubscribeURL: subscribeUrl,
+        Timestamp: clock.nowIso()
+      },
+      signingCertUrl
+    );
+
+    const payload = JSON.stringify(confirmationEnvelope);
+
+    db.prepare(`
+      INSERT INTO ipn_outbox (
+        payment_id, sns_message_id, sns_type, payload, signature,
+        attempts, next_attempt_at, locked_until, status
+      ) VALUES (?, ?, 'SubscriptionConfirmation', ?, ?, 0, ?, 0, 'PENDING')
+    `).run(
+      targetUrl,
+      confirmationEnvelope.MessageId,
+      payload,
+      confirmationEnvelope.Signature,
+      clock.nowMs()
+    );
+
+    if (workerEvents) {
+      workerEvents.emit('wake');
+    }
+
+    return reply.code(200).send({
+      status: 'PENDING_CONFIRMATION',
+      targetUrl,
+      token,
+      subscribeURL: subscribeUrl
+    });
+  });
+
+  // 9. GET /_paysim/sns/confirm (Subscription confirmation activation endpoint)
+  app.get<{ Querystring: { token: string } }>('/_paysim/sns/confirm', async (req, reply) => {
+    const { token } = req.query;
+    if (!token) {
+      return reply.code(400).send({ error: 'Missing token' });
+    }
+
+    const sub = confirmWebhookSubscription(db, token, clock.nowMs());
+    if (!sub) {
+      return reply.code(404).send({ error: 'Invalid or expired token' });
+    }
+
+    return reply.code(200).send({
+      status: 'ACTIVE',
+      targetUrl: sub.target_url,
+      confirmedAt: clock.nowIso()
+    });
+  });
 
   return app;
 }

@@ -60,6 +60,14 @@ export function runMigrations(db: DatabaseType): void {
       seed INTEGER
     );
 
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      target_url TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      token TEXT NOT NULL,
+      topic_arn TEXT NOT NULL,
+      confirmed_at INTEGER
+    );
+
     CREATE INDEX IF NOT EXISTS idx_payments_trx_id ON payments(trx_id);
     CREATE INDEX IF NOT EXISTS idx_ipn_outbox_status ON ipn_outbox(status, next_attempt_at);
     CREATE INDEX IF NOT EXISTS idx_events_payment_id ON events(payment_id);

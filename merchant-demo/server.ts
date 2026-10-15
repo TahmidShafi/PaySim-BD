@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { parseAmountToPaisa } from '../src/core/paisa.js';
+import { verifySnsMessage } from '../src/delivery/sns-verifier.js';
 
 export interface MerchantServerOptions {
   dbPath?: string;
@@ -138,7 +139,9 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
         });
         executeResponse = await res.text();
       } catch (err: unknown) {
-        executeResponse = JSON.stringify({ error: err instanceof Error ? err.message : String(err) });
+        executeResponse = JSON.stringify({
+          error: err instanceof Error ? err.message : String(err)
+        });
       }
     }
 
@@ -155,7 +158,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
     });
   });
 
-  // 1. POST /ipn/naive: increments balance WITHOUT idempotency protection
+  // 1. POST /ipn/naive: increments balance WITHOUT idempotency or signature protection
   app.post('/ipn/naive', async (req, reply) => {
     const ipn = extractIpnData(req.body);
 
@@ -204,6 +207,82 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
       mode: 'idempotent',
       credited
     });
+  });
+
+  // 3. POST /ipn/hardened: validates AWS SNS RSA-SHA1 signature and confirms subscriptions
+  app.post('/ipn/hardened', async (req, reply) => {
+    const rawBody =
+      typeof req.body === 'string'
+        ? (JSON.parse(req.body) as Record<string, unknown>)
+        : (req.body as Record<string, unknown>);
+
+    const verifyResult = await verifySnsMessage(rawBody, {
+      allowedCertHosts: ['localhost', '127.0.0.1']
+    });
+
+    if (!verifyResult.valid) {
+      return reply.code(400).send({
+        error: 'Invalid SNS signature',
+        details: verifyResult.error
+      });
+    }
+
+    const messageType = String(
+      req.headers['x-amz-sns-message-type'] ?? rawBody['Type'] ?? ''
+    );
+
+    // Handshake: automatically visit SubscribeURL on SubscriptionConfirmation
+    if (messageType === 'SubscriptionConfirmation') {
+      const subscribeUrl = String(rawBody['SubscribeURL'] ?? '');
+      if (subscribeUrl) {
+        try {
+          await fetch(subscribeUrl, { method: 'GET' });
+        } catch (err: unknown) {
+          return reply.code(500).send({
+            error: 'Failed to visit SubscribeURL',
+            details: err instanceof Error ? err.message : String(err)
+          });
+        }
+      }
+      return reply.code(200).send({ status: 'subscription_confirmed' });
+    }
+
+    // Payment notification: verify and run idempotent transaction
+    if (messageType === 'Notification') {
+      const ipn = extractIpnData(rawBody);
+      let credited = false;
+
+      if (ipn.transactionStatus === 'Completed') {
+        const txn = db.transaction(() => {
+          const insertStmt = db.prepare(`
+            INSERT INTO processed_transactions (trx_id, order_id, processed_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(trx_id) DO NOTHING
+          `);
+
+          const insertResult = insertStmt.run(ipn.trxID, ipn.orderId, Date.now());
+
+          if (insertResult.changes === 1) {
+            db.prepare(`
+              UPDATE orders
+              SET balance_paisa = balance_paisa + ?, updated_at = ?
+              WHERE order_id = ?
+            `).run(ipn.amountPaisa, Date.now(), ipn.orderId);
+            credited = true;
+          }
+        });
+
+        txn.immediate();
+      }
+
+      return reply.code(200).send({
+        status: 'ok',
+        mode: 'hardened',
+        credited
+      });
+    }
+
+    return reply.code(200).send({ status: 'ignored', type: messageType });
   });
 
   return { app, db, setPaysimConfig };
