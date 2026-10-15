@@ -53,13 +53,13 @@ export function transitionPayment(current: PaymentStatus, action: PaymentAction)
         return {
           ok: false,
           statusCode: '2062',
-          statusMessage: 'The payment has already been completed'
+          statusMessage: 'The payment has already been executed'
         };
 
       case 'INITIATED':
         return {
           ok: false,
-          statusCode: '2019',
+          statusCode: '2029',
           statusMessage: 'Cannot execute payment: payment has not been approved by wallet callback',
           uatViolation: 'UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK'
         };
@@ -75,7 +75,7 @@ export function transitionPayment(current: PaymentStatus, action: PaymentAction)
       case 'CANCELLED':
         return {
           ok: false,
-          statusCode: '2030',
+          statusCode: '2029',
           statusMessage: 'Cannot execute payment: payment was CANCELLED by user',
           uatViolation: 'UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK'
         };
@@ -83,7 +83,7 @@ export function transitionPayment(current: PaymentStatus, action: PaymentAction)
       case 'EXPIRED':
         return {
           ok: false,
-          statusCode: '2069',
+          statusCode: '2029',
           statusMessage: 'Cannot execute payment: payment window has EXPIRED',
           uatViolation: 'UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK'
         };

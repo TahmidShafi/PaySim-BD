@@ -48,7 +48,7 @@ describe('Payment State Machine', () => {
       expect(res.ok).toBe(false);
       if (!res.ok) {
         expect(res.uatViolation).toBe('UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK');
-        expect(res.statusCode).toBe('2019');
+        expect(res.statusCode).toBe('2029');
       }
     });
 
@@ -66,7 +66,7 @@ describe('Payment State Machine', () => {
       expect(res.ok).toBe(false);
       if (!res.ok) {
         expect(res.uatViolation).toBe('UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK');
-        expect(res.statusCode).toBe('2030');
+        expect(res.statusCode).toBe('2029');
       }
     });
 
@@ -75,7 +75,7 @@ describe('Payment State Machine', () => {
       expect(res.ok).toBe(false);
       if (!res.ok) {
         expect(res.uatViolation).toBe('UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK');
-        expect(res.statusCode).toBe('2069');
+        expect(res.statusCode).toBe('2029');
       }
     });
 
@@ -84,7 +84,7 @@ describe('Payment State Machine', () => {
       expect(res.ok).toBe(false);
       if (!res.ok) {
         expect(res.statusCode).toBe('2062');
-        expect(res.statusMessage).toMatch(/already been completed/);
+        expect(res.statusMessage).toMatch(/already been executed/);
         // Duplicate execute on completed is a business rejection, not callback-skipping UAT violation
         expect(res.uatViolation).toBeUndefined();
       }

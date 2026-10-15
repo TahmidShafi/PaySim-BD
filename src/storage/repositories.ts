@@ -93,6 +93,28 @@ export function getTokenById(db: DatabaseType, idToken: string): TokenRecord | u
   return stmt.get(idToken) as TokenRecord | undefined;
 }
 
+export function getTokenByRefreshToken(db: DatabaseType, refreshToken: string): TokenRecord | undefined {
+  const stmt = db.prepare(
+    'SELECT * FROM tokens WHERE refresh_token = ? AND revoked = 0 ORDER BY issued_at DESC LIMIT 1'
+  );
+  return stmt.get(refreshToken) as TokenRecord | undefined;
+}
+
+export function insertEvent(db: DatabaseType, event: EventRecord): void {
+  const stmt = db.prepare(`
+    INSERT INTO events (ts, kind, payment_id, request, response, chaos_applied)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    event.ts,
+    event.kind,
+    event.payment_id ?? null,
+    event.request ?? null,
+    event.response ?? null,
+    event.chaos_applied ?? null
+  );
+}
+
 export function insertPayment(db: DatabaseType, payment: PaymentRecord): void {
   const stmt = db.prepare(`
     INSERT INTO payments (

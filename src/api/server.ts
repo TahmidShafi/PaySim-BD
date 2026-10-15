@@ -9,8 +9,11 @@ import { transitionPayment, type PaymentStatus } from '../core/state-machine.js'
 import {
   insertPayment,
   getPaymentById,
+  updatePaymentStatus,
   insertToken,
   getTokenById,
+  getTokenByRefreshToken,
+  insertEvent,
   atomicExecutePaymentWithOutbox,
   type PaymentRecord
 } from '../storage/repositories.js';
@@ -41,6 +44,17 @@ const ExecutePaymentSchema = z.object({
 
 const PaymentStatusSchema = z.object({
   paymentID: z.string()
+});
+
+const RefreshTokenSchema = z.object({
+  refresh_token: z.string().min(1),
+  app_key: z.string().optional(),
+  app_secret: z.string().optional()
+});
+
+const AdvanceClockSchema = z.object({
+  seconds: z.number().optional(),
+  ms: z.number().optional()
 });
 
 let trxSequence = 0;
@@ -82,7 +96,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
     const tokenRecord = getTokenById(db, token);
 
-    if (!tokenRecord || (tokenRecord.revoked ?? 0) === 1 || tokenRecord.id_expires_at < clock.nowMs()) {
+    if (!tokenRecord || (tokenRecord.revoked ?? 0) === 1 || tokenRecord.id_expires_at <= clock.nowMs()) {
       return reply.code(401).send({
         statusCode: '2007',
         statusMessage: 'Unauthorized: Invalid or expired token'
@@ -90,19 +104,76 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     }
   };
 
+  /**
+   * Performs wallet state transition and dispatches simulated asynchronous GET callback
+   */
+  async function performWalletAction(
+    paymentId: string,
+    actionInput?: 'approve' | 'fail' | 'cancel',
+    customerMsisdnInput?: string | null
+  ): Promise<{ action: 'approve' | 'fail' | 'cancel'; callbackStatus: 'success' | 'failure' | 'cancel'; statusCode: string }> {
+    const payment = getPaymentById(db, paymentId);
+    if (!payment) {
+      throw new Error(`Payment with ID "${paymentId}" not found`);
+    }
+
+    const msisdn = customerMsisdnInput ?? payment.customer_msisdn ?? payment.payer_reference ?? '';
+
+    let action: 'approve' | 'fail' | 'cancel' = actionInput ?? 'approve';
+    let statusCode = '0000';
+
+    // bKash sandbox test wallet automatic mapping
+    if (msisdn === '01823074817') {
+      action = 'fail';
+      statusCode = '2023'; // Insufficient balance
+    } else if (msisdn === '01823074818') {
+      action = 'fail';
+      statusCode = '2024'; // Debit block
+    } else if (['01770618575', '01619777283', '01877722345'].includes(msisdn)) {
+      action = 'approve';
+      statusCode = '0000';
+    }
+
+    let callbackStatus: 'success' | 'failure' | 'cancel' = 'success';
+    let paymentAction: 'APPROVE_PAYMENT' | 'FAIL_PAYMENT' | 'CANCEL_PAYMENT' = 'APPROVE_PAYMENT';
+
+    if (action === 'fail') {
+      callbackStatus = 'failure';
+      paymentAction = 'FAIL_PAYMENT';
+    } else if (action === 'cancel') {
+      callbackStatus = 'cancel';
+      paymentAction = 'CANCEL_PAYMENT';
+    }
+
+    const transitionRes = transitionPayment(payment.status as PaymentStatus, paymentAction);
+    if (transitionRes.ok) {
+      updatePaymentStatus(db, payment.payment_id, transitionRes.nextStatus, clock.nowMs());
+    }
+
+    // Fire asynchronous HTTP GET request to callbackURL: <callbackURL>?paymentID=<id>&status=<status>
+    const delim = payment.callback_url.includes('?') ? '&' : '?';
+    const callbackTarget = `${payment.callback_url}${delim}paymentID=${payment.payment_id}&status=${callbackStatus}`;
+    fetch(callbackTarget, { method: 'GET' }).catch(() => {
+      // Fire-and-forget
+    });
+
+    return { action, callbackStatus, statusCode };
+  }
+
   // 1. POST /tokenized/checkout/token/grant
   app.post('/tokenized/checkout/token/grant', async (_req, reply) => {
     const now = clock.nowMs();
     const idToken = `tok_${crypto.randomUUID().replace(/-/g, '')}`;
     const refreshToken = `ref_${crypto.randomUUID().replace(/-/g, '')}`;
-    const expiresIn = 3600; // 1 hour
+    const expiresIn = 3600; // 1 hour (3600 seconds)
+    const refreshExpiresIn = 2419200; // 28 days (2,419,200 seconds)
 
     insertToken(db, {
       id_token: idToken,
       refresh_token: refreshToken,
       issued_at: now,
       id_expires_at: now + expiresIn * 1000,
-      refresh_expires_at: now + 28 * 24 * 3600 * 1000,
+      refresh_expires_at: now + refreshExpiresIn * 1000,
       revoked: 0
     });
 
@@ -116,7 +187,69 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     });
   });
 
-  // 2. POST /tokenized/checkout/create
+  // 2. POST /tokenized/checkout/token/refresh
+  app.post('/tokenized/checkout/token/refresh', async (req, reply) => {
+    const parseResult = RefreshTokenSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(401).send({
+        statusCode: '2007',
+        statusMessage: 'Unauthorized: Missing refresh_token'
+      });
+    }
+
+    const { refresh_token } = parseResult.data;
+    const tokenRecord = getTokenByRefreshToken(db, refresh_token);
+    const now = clock.nowMs();
+
+    if (!tokenRecord || (tokenRecord.revoked ?? 0) === 1 || now >= tokenRecord.refresh_expires_at) {
+      return reply.code(401).send({
+        statusCode: '2007',
+        statusMessage: 'Unauthorized: Invalid or expired refresh token'
+      });
+    }
+
+    const newIdToken = `tok_${crypto.randomUUID().replace(/-/g, '')}`;
+    const expiresIn = 3600; // 1 hour
+
+    // Preserve the original refresh_expires_at timestamp per bKash UAT specification!
+    insertToken(db, {
+      id_token: newIdToken,
+      refresh_token: tokenRecord.refresh_token,
+      issued_at: now,
+      id_expires_at: now + expiresIn * 1000,
+      refresh_expires_at: tokenRecord.refresh_expires_at,
+      revoked: 0
+    });
+
+    return reply.code(200).send({
+      statusCode: '0000',
+      statusMessage: 'Successful',
+      id_token: newIdToken,
+      token_type: 'Bearer',
+      expires_in: expiresIn,
+      refresh_token: tokenRecord.refresh_token
+    });
+  });
+
+  // 3. POST /_paysim/clock/advance (Virtual clock control for testing)
+  app.post('/_paysim/clock/advance', async (req, reply) => {
+    const parseResult = AdvanceClockSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(400).send({ error: 'Invalid advance parameters' });
+    }
+
+    const deltaMs = (parseResult.data.ms ?? 0) + (parseResult.data.seconds ?? 0) * 1000;
+    if (deltaMs > 0) {
+      clock.advanceMs(deltaMs);
+    }
+
+    return reply.code(200).send({
+      nowMs: clock.nowMs(),
+      nowIso: clock.nowIso()
+    });
+  });
+
+  // 4. POST /tokenized/checkout/create
   app.post(
     '/tokenized/checkout/create',
     { preHandler: verifyBearerToken },
@@ -143,7 +276,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       const paymentId = `TR0011${crypto.randomUUID().replace(/-/g, '').slice(0, 14).toUpperCase()}`;
       const now = clock.nowMs();
 
-      // For Milestone 1 skeleton, initialize directly in APPROVED status so create -> execute works end-to-end
+      // Created in INITIATED state per real bKash protocol
       const paymentRecord: PaymentRecord = {
         payment_id: paymentId,
         invoice: body.merchantInvoiceNumber,
@@ -154,7 +287,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
         payer_reference: body.payerReference ?? null,
         customer_msisdn: body.customerMsisdn ?? null,
         callback_url: body.callbackURL,
-        status: 'APPROVED',
+        status: 'INITIATED',
         trx_id: null,
         created_at: now,
         updated_at: now
@@ -162,11 +295,27 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
 
       insertPayment(db, paymentRecord);
 
+      const host = req.headers.host ?? 'localhost';
+      const bkashURL = `http://${host}/_paysim/checkout/${paymentId}`;
+
+      // Support Headless CI Auto-Approve on /create
+      const autoApproveHeader = req.headers['x-paysim-auto-approve'];
+      if (autoApproveHeader) {
+        const headerVal = String(autoApproveHeader).toLowerCase();
+        let autoAction: 'approve' | 'fail' | 'cancel' = 'approve';
+        if (headerVal === 'failure' || headerVal === 'fail') autoAction = 'fail';
+        else if (headerVal === 'cancel') autoAction = 'cancel';
+
+        setImmediate(() => {
+          void performWalletAction(paymentId, autoAction, body.customerMsisdn);
+        });
+      }
+
       return reply.code(200).send({
         statusCode: '0000',
         statusMessage: 'Successful',
         paymentID: paymentId,
-        bkashURL: `https://sandbox.payment.bkash.com/redirect?paymentID=${paymentId}`,
+        bkashURL,
         callbackURL: body.callbackURL,
         successCallbackURL: `${body.callbackURL}?status=success&paymentID=${paymentId}`,
         failureCallbackURL: `${body.callbackURL}?status=failure&paymentID=${paymentId}`,
@@ -181,7 +330,30 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     }
   );
 
-  // 3. POST /tokenized/checkout/execute
+  // 5. POST /_paysim/checkout/:paymentID/action (Simulator wallet action)
+  app.post<{
+    Params: { paymentID: string };
+    Body: { action?: 'approve' | 'fail' | 'cancel'; customerMsisdn?: string };
+  }>('/_paysim/checkout/:paymentID/action', async (req, reply) => {
+    const { paymentID } = req.params;
+    const payment = getPaymentById(db, paymentID);
+    if (!payment) {
+      return reply.code(404).send({ error: 'Payment not found' });
+    }
+
+    const { action, customerMsisdn } = req.body ?? {};
+    const result = await performWalletAction(paymentID, action, customerMsisdn);
+
+    return reply.code(200).send({
+      statusCode: result.statusCode,
+      statusMessage: result.callbackStatus === 'success' ? 'Successful' : 'Failed',
+      paymentID,
+      action: result.action,
+      status: result.callbackStatus
+    });
+  });
+
+  // 6. POST /tokenized/checkout/execute
   app.post(
     '/tokenized/checkout/execute',
     { preHandler: verifyBearerToken },
@@ -206,6 +378,20 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       // Check transition via state machine
       const transitionResult = transitionPayment(payment.status as PaymentStatus, 'EXECUTE_PAYMENT');
       if (!transitionResult.ok) {
+        // Record UAT violation event if Rule 2 was violated
+        if (transitionResult.uatViolation) {
+          insertEvent(db, {
+            ts: clock.nowMs(),
+            kind: transitionResult.uatViolation,
+            payment_id: payment.payment_id,
+            request: JSON.stringify(req.body),
+            response: JSON.stringify({
+              statusCode: transitionResult.statusCode,
+              statusMessage: transitionResult.statusMessage
+            })
+          });
+        }
+
         return reply.code(200).send({
           statusCode: transitionResult.statusCode,
           statusMessage: transitionResult.statusMessage
@@ -288,7 +474,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     }
   );
 
-  // 4. POST /tokenized/checkout/payment/status
+  // 7. POST /tokenized/checkout/payment/status
   app.post(
     '/tokenized/checkout/payment/status',
     { preHandler: verifyBearerToken },

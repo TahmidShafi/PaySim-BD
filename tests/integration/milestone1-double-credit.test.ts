@@ -89,7 +89,8 @@ describe('Milestone 1 Integration: Walking Skeleton & Double-Credit Proof', () =
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+        Authorization: `Bearer ${token}`,
+        'x-paysim-auto-approve': 'success'
       },
       body: JSON.stringify({
         amount: '500.00',
@@ -102,6 +103,9 @@ describe('Milestone 1 Integration: Walking Skeleton & Double-Credit Proof', () =
     const createData = (await createRes.json()) as { paymentID: string; statusCode: string };
     expect(createData.statusCode).toBe('0000');
     expect(createData.paymentID).toBeDefined();
+
+    // Allow setImmediate auto-approve to finish
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     // 4. Execute payment
     const execRes = await fetch(`${simBaseUrl}/tokenized/checkout/execute`, {
@@ -158,7 +162,8 @@ describe('Milestone 1 Integration: Walking Skeleton & Double-Credit Proof', () =
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+        Authorization: `Bearer ${token}`,
+        'x-paysim-auto-approve': 'success'
       },
       body: JSON.stringify({
         amount: '500.00',
@@ -171,6 +176,9 @@ describe('Milestone 1 Integration: Walking Skeleton & Double-Credit Proof', () =
     const createData = (await createRes.json()) as { paymentID: string; statusCode: string };
     expect(createData.statusCode).toBe('0000');
     expect(createData.paymentID).toBeDefined();
+
+    // Allow setImmediate auto-approve to finish
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     // 4. Execute payment
     const execRes = await fetch(`${simBaseUrl}/tokenized/checkout/execute`, {

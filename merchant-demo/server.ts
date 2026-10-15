@@ -5,6 +5,8 @@ import { parseAmountToPaisa } from '../src/core/paisa.js';
 export interface MerchantServerOptions {
   dbPath?: string;
   logger?: boolean;
+  paysimBaseUrl?: string;
+  idToken?: string;
 }
 
 export function createMerchantDatabase(dbPath: string = ':memory:'): DatabaseType {
@@ -26,6 +28,14 @@ export function createMerchantDatabase(dbPath: string = ':memory:'): DatabaseTyp
       order_id TEXT,
       processed_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS callback_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payment_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      execute_response TEXT,
+      received_at INTEGER NOT NULL
+    );
   `);
 
   return db;
@@ -39,7 +49,10 @@ interface ParsedIpn {
 }
 
 function extractIpnData(body: unknown): ParsedIpn {
-  const raw = typeof body === 'string' ? (JSON.parse(body) as Record<string, unknown>) : (body as Record<string, unknown>);
+  const raw =
+    typeof body === 'string'
+      ? (JSON.parse(body) as Record<string, unknown>)
+      : (body as Record<string, unknown>);
   let message: Record<string, unknown> = raw;
 
   if (raw['Message']) {
@@ -65,9 +78,18 @@ function extractIpnData(body: unknown): ParsedIpn {
 export function createMerchantServer(options: MerchantServerOptions = {}): {
   app: FastifyInstance;
   db: DatabaseType;
+  setPaysimConfig: (paysimBaseUrl: string, idToken: string) => void;
 } {
   const db = createMerchantDatabase(options.dbPath ?? ':memory:');
   const app = Fastify({ logger: options.logger ?? false });
+
+  let paysimUrl = options.paysimBaseUrl ?? '';
+  let token = options.idToken ?? '';
+
+  const setPaysimConfig = (newUrl: string, newToken: string) => {
+    paysimUrl = newUrl;
+    token = newToken;
+  };
 
   // Order management helpers
   app.post<{ Body: { orderId: string; customerId: string; initialBalancePaisa?: number } }>(
@@ -93,6 +115,44 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
       return reply.code(404).send({ error: 'Order not found' });
     }
     return reply.send(row);
+  });
+
+  // GET /bkash/callback: receives browser redirect or simulated callback GET
+  app.get<{
+    Querystring: { paymentID: string; status: string };
+  }>('/bkash/callback', async (req, reply) => {
+    const { paymentID, status } = req.query;
+
+    let executeResponse: string | null = null;
+
+    // When status === 'success', automatically call execute on PaySim-BD
+    if (status === 'success' && paysimUrl && token) {
+      try {
+        const res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ paymentID })
+        });
+        executeResponse = await res.text();
+      } catch (err: unknown) {
+        executeResponse = JSON.stringify({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO callback_events (payment_id, status, execute_response, received_at)
+      VALUES (?, ?, ?, ?)
+    `).run(paymentID, status, executeResponse, Date.now());
+
+    return reply.code(200).send({
+      status: 'ok',
+      paymentID,
+      callbackStatus: status,
+      executeResponse: executeResponse ? JSON.parse(executeResponse) : null
+    });
   });
 
   // 1. POST /ipn/naive: increments balance WITHOUT idempotency protection
@@ -146,5 +206,5 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
     });
   });
 
-  return { app, db };
+  return { app, db, setPaysimConfig };
 }
