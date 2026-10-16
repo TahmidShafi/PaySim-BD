@@ -17,9 +17,20 @@ import {
   atomicExecutePaymentWithOutbox,
   insertWebhookSubscription,
   confirmWebhookSubscription,
-  type PaymentRecord
+  insertChaosRule,
+  getChaosRules,
+  clearChaosRules,
+  deleteChaosRule,
+  type PaymentRecord,
+  type ChaosRuleRecord,
+  type OutboxItemParam
 } from '../storage/repositories.js';
 import { buildOutboxItems, type DuplicateChaosRule } from '../chaos/duplicate.js';
+import {
+  applyOutboxChaosHooks,
+  executeGatewayPostCommitHook,
+  type PaymentMatchContext
+} from '../chaos/engine.js';
 import {
   loadDefaultTestCertificate,
   createSignedNotificationEnvelope,
@@ -68,6 +79,16 @@ const RegisterWebhookSchema = z.object({
   targetUrl: z.string().url()
 });
 
+const ChaosRuleInputSchema = z.object({
+  id: z.string().min(1),
+  match: z.record(z.unknown()).optional(),
+  match_json: z.string().optional(),
+  action: z.string().min(1),
+  params: z.record(z.unknown()).optional(),
+  params_json: z.string().optional(),
+  seed: z.number().optional().nullable()
+});
+
 let trxSequence = 0;
 
 /**
@@ -87,7 +108,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   const { db, clock, workerEvents, logger = false } = options;
   let activeChaosRule = options.chaosRule ?? null;
 
-  const app = Fastify({ logger });
+  const app = Fastify({ logger, forceCloseConnections: true });
 
   // Optional chaos rule toggle at runtime
   app.decorate('setChaosRule', (rule: DuplicateChaosRule | null) => {
@@ -452,14 +473,49 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
 
       const snsEnvelope = JSON.stringify(signedNotification);
 
-      // Apply duplicate chaos rule if configured
-      const outboxItems = buildOutboxItems({
-        basePayload: snsEnvelope,
+      // Fetch active chaos rules from DB
+      const dbRules = getChaosRules(db);
+      const matchContext: PaymentMatchContext = {
+        paymentId: payment.payment_id,
+        payerReference: payment.payer_reference,
+        customerMsisdn: payment.customer_msisdn
+      };
+
+      const baseOutboxItem: OutboxItemParam = {
+        sns_message_id: signedNotification.MessageId,
+        sns_type: 'Notification',
+        payload: snsEnvelope,
         signature: signedNotification.Signature,
-        snsType: 'Notification',
-        nowMs: now,
-        chaosRule: activeChaosRule
-      });
+        next_attempt_at: now
+      };
+
+      let outboxItems: OutboxItemParam[];
+      if (dbRules.length > 0) {
+        const outboxResult = applyOutboxChaosHooks(dbRules, matchContext, baseOutboxItem, now);
+        outboxItems = outboxResult.outboxItems;
+      } else {
+        outboxItems = buildOutboxItems({
+          basePayload: snsEnvelope,
+          signature: signedNotification.Signature,
+          snsType: 'Notification',
+          nowMs: now,
+          chaosRule: activeChaosRule
+        });
+      }
+
+      // Prepare ipn_delivered listener BEFORE committing and waking worker
+      let ipnDeliveredPromise: Promise<void> | undefined;
+      if (workerEvents) {
+        ipnDeliveredPromise = new Promise<void>((resolve) => {
+          const onDelivered = (deliveredPaymentId: string) => {
+            if (deliveredPaymentId === payment.payment_id) {
+              workerEvents.off('ipn_delivered', onDelivered);
+              resolve();
+            }
+          };
+          workerEvents.on('ipn_delivered', onDelivered);
+        });
+      }
 
       // Synchronous atomic transaction: state transition + outbox enqueue
       atomicExecutePaymentWithOutbox(db, {
@@ -478,6 +534,30 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       // Post-commit hook: wake the outbox delivery worker AFTER SQLite commits
       if (workerEvents) {
         workerEvents.emit('wake');
+      }
+
+      // Execute Gateway Post-Commit Hook strictly AFTER commit and worker wake
+      if (dbRules.length > 0) {
+        const postCommitResult = await executeGatewayPostCommitHook(
+          dbRules,
+          matchContext,
+          db,
+          workerEvents,
+          now,
+          ipnDeliveredPromise
+        );
+
+        if (postCommitResult.timedOut) {
+          if (req.raw.destroyed) {
+            return;
+          }
+          return reply.code(postCommitResult.httpStatus ?? 504).send(
+            postCommitResult.errorPayload ?? {
+              statusCode: '504',
+              statusMessage: 'Gateway Timeout'
+            }
+          );
+        }
       }
 
       return reply.code(200).send({
@@ -614,6 +694,49 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       targetUrl: sub.target_url,
       confirmedAt: clock.nowIso()
     });
+  });
+
+  // 10. POST /_paysim/chaos/rules (Register or upsert chaos rule)
+  app.post('/_paysim/chaos/rules', async (req, reply) => {
+    const parseResult = ChaosRuleInputSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(400).send({
+        error: 'Invalid chaos rule parameters',
+        details: parseResult.error.issues
+      });
+    }
+
+    const { id, match, match_json, action, params, params_json, seed } = parseResult.data;
+    const finalMatchJson = match_json ?? JSON.stringify(match ?? {});
+    const finalParamsJson = params_json ?? JSON.stringify(params ?? {});
+
+    const record: ChaosRuleRecord = {
+      id,
+      match_json: finalMatchJson,
+      action,
+      params_json: finalParamsJson,
+      seed: seed ?? null
+    };
+
+    insertChaosRule(db, record);
+
+    return reply.code(200).send({
+      status: 'ok',
+      rule: record
+    });
+  });
+
+  // 11. DELETE /_paysim/chaos/rules (Clear all chaos rules)
+  app.delete('/_paysim/chaos/rules', async (_req, reply) => {
+    clearChaosRules(db);
+    activeChaosRule = null;
+    return reply.code(200).send({ status: 'cleared' });
+  });
+
+  // 12. GET /_paysim/chaos/rules (List all chaos rules)
+  app.get('/_paysim/chaos/rules', async (_req, reply) => {
+    const rules = getChaosRules(db);
+    return reply.code(200).send({ rules });
   });
 
   return app;

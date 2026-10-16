@@ -110,6 +110,9 @@ export class OutboxWorker {
 
       if (res.ok) {
         markOutboxDelivered(this.db, row.id, res.status);
+        if (this.eventEmitter) {
+          this.eventEmitter.emit('ipn_delivered', row.payment_id);
+        }
       } else {
         const errorText = await res.text().catch(() => '');
         const errorMsg = `HTTP ${res.status}: ${errorText.slice(0, 200)}`;

@@ -420,3 +420,38 @@ export function markOutboxRetry(
     WHERE id = ?
   `).run(isDead ? 'DEAD' : 'RETRY', nextAttemptAt, lastError, lastHttpStatus ?? null, id);
 }
+
+export interface ChaosRuleRecord {
+  id: string;
+  match_json: string;
+  action: string;
+  params_json: string;
+  seed?: number | null;
+}
+
+export function insertChaosRule(db: DatabaseType, rule: ChaosRuleRecord): void {
+  const stmt = db.prepare(`
+    INSERT INTO chaos_rules (id, match_json, action, params_json, seed)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      match_json = excluded.match_json,
+      action = excluded.action,
+      params_json = excluded.params_json,
+      seed = excluded.seed
+  `);
+  stmt.run(rule.id, rule.match_json, rule.action, rule.params_json, rule.seed ?? null);
+}
+
+export function getChaosRules(db: DatabaseType): ChaosRuleRecord[] {
+  const stmt = db.prepare('SELECT id, match_json, action, params_json, seed FROM chaos_rules ORDER BY rowid ASC');
+  return stmt.all() as ChaosRuleRecord[];
+}
+
+export function clearChaosRules(db: DatabaseType): void {
+  db.prepare('DELETE FROM chaos_rules').run();
+}
+
+export function deleteChaosRule(db: DatabaseType, id: string): void {
+  db.prepare('DELETE FROM chaos_rules WHERE id = ?').run(id);
+}
+

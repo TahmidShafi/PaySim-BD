@@ -21,7 +21,13 @@ export function createMerchantDatabase(dbPath: string = ':memory:'): DatabaseTyp
       order_id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       balance_paisa INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'PENDING',
       updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_orders (
+      payment_id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS processed_transactions (
@@ -82,7 +88,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
   setPaysimConfig: (paysimBaseUrl: string, idToken: string) => void;
 } {
   const db = createMerchantDatabase(options.dbPath ?? ':memory:');
-  const app = Fastify({ logger: options.logger ?? false });
+  const app = Fastify({ logger: options.logger ?? false, forceCloseConnections: true });
 
   let paysimUrl = options.paysimBaseUrl ?? '';
   let token = options.idToken ?? '';
@@ -93,17 +99,33 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
   };
 
   // Order management helpers
-  app.post<{ Body: { orderId: string; customerId: string; initialBalancePaisa?: number } }>(
+  app.post<{ Body: { orderId: string; customerId: string; initialBalancePaisa?: number; status?: string } }>(
     '/orders',
     async (req, reply) => {
-      const { orderId, customerId, initialBalancePaisa = 0 } = req.body;
+      const { orderId, customerId, initialBalancePaisa = 0, status = 'PENDING' } = req.body;
       const stmt = db.prepare(`
-        INSERT INTO orders (order_id, customer_id, balance_paisa, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(order_id) DO UPDATE SET balance_paisa = excluded.balance_paisa
+        INSERT INTO orders (order_id, customer_id, balance_paisa, status, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(order_id) DO UPDATE SET
+          balance_paisa = excluded.balance_paisa,
+          status = excluded.status,
+          updated_at = excluded.updated_at
       `);
-      stmt.run(orderId, customerId, initialBalancePaisa, Date.now());
-      return reply.code(201).send({ orderId, balancePaisa: initialBalancePaisa });
+      stmt.run(orderId, customerId, initialBalancePaisa, status, Date.now());
+      return reply.code(201).send({ orderId, balancePaisa: initialBalancePaisa, status });
+    }
+  );
+
+  app.post<{ Body: { paymentId: string; orderId: string } }>(
+    '/payments/bind',
+    async (req, reply) => {
+      const { paymentId, orderId } = req.body;
+      db.prepare(`
+        INSERT INTO payment_orders (payment_id, order_id)
+        VALUES (?, ?)
+        ON CONFLICT(payment_id) DO UPDATE SET order_id = excluded.order_id
+      `).run(paymentId, orderId);
+      return reply.code(200).send({ status: 'ok', paymentId, orderId });
     }
   );
 
@@ -118,30 +140,197 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
     return reply.send(row);
   });
 
-  // GET /bkash/callback: receives browser redirect or simulated callback GET
-  app.get<{
-    Querystring: { paymentID: string; status: string };
-  }>('/bkash/callback', async (req, reply) => {
-    const { paymentID, status } = req.query;
+  // Helper to handle callback redirects in naive or hardened mode
+  async function handleCallback(
+    req: { query: { paymentID: string; status: string; mode?: string; orderId?: string } },
+    reply: any,
+    explicitMode?: 'naive' | 'hardened'
+  ) {
+    const { paymentID, status, orderId: queryOrderId } = req.query;
+    const mode = explicitMode ?? (req.query.mode === 'hardened' ? 'hardened' : 'naive');
+
+    // Resolve orderId from query, or payment_orders mapping table
+    let resolvedOrderId = queryOrderId;
+    if (!resolvedOrderId) {
+      const row = db.prepare('SELECT order_id FROM payment_orders WHERE payment_id = ?').get(paymentID) as
+        | { order_id: string }
+        | undefined;
+      if (row) resolvedOrderId = row.order_id;
+    }
 
     let executeResponse: string | null = null;
+    let recoveredTrxId: string | null = null;
 
-    // When status === 'success', automatically call execute on PaySim-BD
     if (status === 'success' && paysimUrl && token) {
-      try {
-        const res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify({ paymentID })
-        });
-        executeResponse = await res.text();
-      } catch (err: unknown) {
-        executeResponse = JSON.stringify({
-          error: err instanceof Error ? err.message : String(err)
-        });
+      if (mode === 'naive') {
+        // Naive flow:
+        // Calls POST /tokenized/checkout/execute with a 100ms timeout.
+        // If /execute times out or returns HTTP 504, marks order as 'FAILED' and does NOT call /payment/status!
+        try {
+          const res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`
+            },
+            body: JSON.stringify({ paymentID }),
+            signal: AbortSignal.timeout(100)
+          });
+          executeResponse = await res.text();
+          const parsed = JSON.parse(executeResponse) as {
+            statusCode?: string;
+            amount?: string;
+            trxID?: string;
+            merchantInvoiceNumber?: string;
+          };
+
+          if (res.ok && parsed.statusCode === '0000') {
+            const amountPaisa = parseAmountToPaisa(parsed.amount ?? '0');
+            const targetOrder = parsed.merchantInvoiceNumber ?? resolvedOrderId;
+            if (targetOrder) {
+              // Direct increment without idempotency guard (vulnerable to double-credit!)
+              db.prepare(`
+                UPDATE orders
+                SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
+                WHERE order_id = ?
+              `).run(amountPaisa, Date.now(), targetOrder);
+            }
+          } else {
+            // Execution failed or non-200 / non-0000 -> mark order FAILED
+            if (resolvedOrderId) {
+              db.prepare(`
+                UPDATE orders SET status = 'FAILED', updated_at = ? WHERE order_id = ?
+              `).run(Date.now(), resolvedOrderId);
+            }
+          }
+        } catch (err: unknown) {
+          executeResponse = JSON.stringify({
+            error: err instanceof Error ? err.message : String(err)
+          });
+          // Timeout or transport failure: naive merchant marks order as FAILED, leaving customer debited in bKash!
+          if (resolvedOrderId) {
+            db.prepare(`
+              UPDATE orders SET status = 'FAILED', updated_at = ? WHERE order_id = ?
+            `).run(Date.now(), resolvedOrderId);
+          }
+        }
+      } else {
+        // Hardened flow:
+        // Calls POST /tokenized/checkout/execute with a 100ms timeout.
+        // If /execute times out or returns HTTP 504, falls back to POST /tokenized/checkout/payment/status.
+        let executeOk = false;
+        let executeData: {
+          statusCode?: string;
+          amount?: string;
+          trxID?: string;
+          merchantInvoiceNumber?: string;
+        } | null = null;
+
+        try {
+          const res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`
+            },
+            body: JSON.stringify({ paymentID }),
+            signal: AbortSignal.timeout(100)
+          });
+          executeResponse = await res.text();
+          if (res.ok) {
+            executeData = JSON.parse(executeResponse);
+            if (executeData?.statusCode === '0000' && executeData.trxID) {
+              executeOk = true;
+            }
+          }
+        } catch (err: unknown) {
+          executeResponse = JSON.stringify({
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
+
+        if (executeOk && executeData?.trxID) {
+          // Normal execute success: run shared idempotent credit
+          const targetOrder = executeData.merchantInvoiceNumber ?? resolvedOrderId;
+          const amountPaisa = parseAmountToPaisa(executeData.amount ?? '0');
+          if (targetOrder) {
+            const txn = db.transaction(() => {
+              const insertStmt = db.prepare(`
+                INSERT INTO processed_transactions (trx_id, order_id, processed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(trx_id) DO NOTHING
+              `);
+              const insertResult = insertStmt.run(executeData!.trxID!, targetOrder, Date.now());
+              if (insertResult.changes === 1) {
+                db.prepare(`
+                  UPDATE orders
+                  SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
+                  WHERE order_id = ?
+                `).run(amountPaisa, Date.now(), targetOrder);
+              } else {
+                db.prepare(`
+                  UPDATE orders
+                  SET status = 'COMPLETED', updated_at = ?
+                  WHERE order_id = ?
+                `).run(Date.now(), targetOrder);
+              }
+            });
+            txn.immediate();
+          }
+        } else {
+          // FALLBACK RECOVERY: Query /tokenized/checkout/payment/status
+          try {
+            const statusRes = await fetch(`${paysimUrl}/tokenized/checkout/payment/status`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`
+              },
+              body: JSON.stringify({ paymentID })
+            });
+            if (statusRes.ok) {
+              const statusData = (await statusRes.json()) as {
+                statusCode: string;
+                transactionStatus: string;
+                trxID?: string;
+                amount?: string;
+                merchantInvoiceNumber?: string;
+              };
+
+              if (statusData.statusCode === '0000' && statusData.transactionStatus === 'Completed' && statusData.trxID) {
+                recoveredTrxId = statusData.trxID;
+                const targetOrder = statusData.merchantInvoiceNumber ?? resolvedOrderId;
+                const amountPaisa = parseAmountToPaisa(statusData.amount ?? '0');
+                if (targetOrder) {
+                  const txn = db.transaction(() => {
+                    const insertStmt = db.prepare(`
+                      INSERT INTO processed_transactions (trx_id, order_id, processed_at)
+                      VALUES (?, ?, ?)
+                      ON CONFLICT(trx_id) DO NOTHING
+                    `);
+                    const insertResult = insertStmt.run(statusData.trxID!, targetOrder, Date.now());
+                    if (insertResult.changes === 1) {
+                      db.prepare(`
+                        UPDATE orders
+                        SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
+                        WHERE order_id = ?
+                      `).run(amountPaisa, Date.now(), targetOrder);
+                    } else {
+                      db.prepare(`
+                        UPDATE orders
+                        SET status = 'COMPLETED', updated_at = ?
+                        WHERE order_id = ?
+                      `).run(Date.now(), targetOrder);
+                    }
+                  });
+                  txn.immediate();
+                }
+              }
+            }
+          } catch {
+            // Ignore status query error
+          }
+        }
       }
     }
 
@@ -154,8 +343,29 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
       status: 'ok',
       paymentID,
       callbackStatus: status,
-      executeResponse: executeResponse ? JSON.parse(executeResponse) : null
+      mode,
+      executeResponse: executeResponse ? JSON.parse(executeResponse) : null,
+      recoveredTrxId
     });
+  }
+
+  // GET /bkash/callback: receives browser redirect or simulated callback GET
+  app.get<{
+    Querystring: { paymentID: string; status: string; mode?: string; orderId?: string };
+  }>('/bkash/callback', async (req, reply) => {
+    return handleCallback(req, reply);
+  });
+
+  app.get<{
+    Querystring: { paymentID: string; status: string; orderId?: string };
+  }>('/bkash/callback/naive', async (req, reply) => {
+    return handleCallback(req, reply, 'naive');
+  });
+
+  app.get<{
+    Querystring: { paymentID: string; status: string; orderId?: string };
+  }>('/bkash/callback/hardened', async (req, reply) => {
+    return handleCallback(req, reply, 'hardened');
   });
 
   // 1. POST /ipn/naive: increments balance WITHOUT idempotency or signature protection
@@ -165,7 +375,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
     if (ipn.transactionStatus === 'Completed') {
       db.prepare(`
         UPDATE orders
-        SET balance_paisa = balance_paisa + ?, updated_at = ?
+        SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
         WHERE order_id = ?
       `).run(ipn.amountPaisa, Date.now(), ipn.orderId);
     }
@@ -192,7 +402,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
         if (insertResult.changes === 1) {
           db.prepare(`
             UPDATE orders
-            SET balance_paisa = balance_paisa + ?, updated_at = ?
+            SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
             WHERE order_id = ?
           `).run(ipn.amountPaisa, Date.now(), ipn.orderId);
           credited = true;
@@ -265,7 +475,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
           if (insertResult.changes === 1) {
             db.prepare(`
               UPDATE orders
-              SET balance_paisa = balance_paisa + ?, updated_at = ?
+              SET balance_paisa = balance_paisa + ?, status = 'COMPLETED', updated_at = ?
               WHERE order_id = ?
             `).run(ipn.amountPaisa, Date.now(), ipn.orderId);
             credited = true;
