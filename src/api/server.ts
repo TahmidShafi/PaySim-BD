@@ -36,6 +36,7 @@ import {
   createSignedNotificationEnvelope,
   createSignedSubscriptionConfirmationEnvelope
 } from '../delivery/sns-signer.js';
+import { checkUatViolations } from '../linter/uat-linter.js';
 
 export interface SimulatorServerOptions {
   db: DatabaseType;
@@ -201,6 +202,25 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   // 1. POST /tokenized/checkout/token/grant
   app.post('/tokenized/checkout/token/grant', async (_req, reply) => {
     const now = clock.nowMs();
+
+    // UAT Rule 1 (Action Point #0): "You must reuse id_token for 1 hour for any subsequent API request"
+    // Triggered if there is already an active, unrevoked token valid at clock.nowMs()
+    const activeToken = db
+      .prepare('SELECT id_token FROM tokens WHERE revoked = 0 AND id_expires_at > ? LIMIT 1')
+      .get(now) as { id_token: string } | undefined;
+
+    if (activeToken) {
+      insertEvent(db, {
+        ts: now,
+        kind: 'UAT_RULE_1_REDUNDANT_TOKEN_GRANT',
+        request: JSON.stringify(_req.body ?? {}),
+        response: JSON.stringify({
+          message:
+            'Violated UAT Action Point #0: Requested new id_token while previous token is still valid. Must reuse id_token for 1 hour.'
+        })
+      });
+    }
+
     const idToken = `tok_${crypto.randomUUID().replace(/-/g, '')}`;
     const refreshToken = `ref_${crypto.randomUUID().replace(/-/g, '')}`;
     const expiresIn = 3600; // 1 hour (3600 seconds)
@@ -599,6 +619,28 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
         });
       }
 
+      // UAT Rule 4 (Action Point #4): "Query payment should only be called if there is no response from the execute API"
+      // Triggered if payment already had a successful /execute without an EXECUTE_TIMEOUT_AFTER_COMMIT fault
+      const paymentEvents = db
+        .prepare('SELECT kind FROM events WHERE payment_id = ?')
+        .all(payment.payment_id) as Array<{ kind: string }>;
+
+      const hasExecuted = paymentEvents.some((e) => e.kind === 'PAYMENT_EXECUTED');
+      const hasTimedOut = paymentEvents.some((e) => e.kind === 'EXECUTE_TIMEOUT_AFTER_COMMIT');
+
+      if (hasExecuted && !hasTimedOut) {
+        insertEvent(db, {
+          ts: clock.nowMs(),
+          kind: 'UAT_RULE_4_UNNECESSARY_QUERY_STATUS',
+          payment_id: payment.payment_id,
+          request: JSON.stringify(req.body ?? {}),
+          response: JSON.stringify({
+            message:
+              'Violated UAT Action Point #4: Query payment was called after execute API had already returned successfully without timeout.'
+          })
+        });
+      }
+
       return reply.code(200).send({
         statusCode: '0000',
         statusMessage: 'Successful',
@@ -738,6 +780,19 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     const rules = getChaosRules(db);
     return reply.code(200).send({ rules });
   });
+
+  // 13. GET /_paysim/linter/violations (Audit report of all UAT compliance violations)
+  app.get<{ Querystring: { paymentId?: string } }>(
+    '/_paysim/linter/violations',
+    async (req, reply) => {
+      const { paymentId } = req.query;
+      const violations = checkUatViolations(db, { paymentId });
+      return reply.code(200).send({
+        count: violations.length,
+        violations
+      });
+    }
+  );
 
   return app;
 }

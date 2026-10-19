@@ -4,10 +4,14 @@
   "description": "Local CLI and chaos webhook simulator for bKash Tokenized Checkout and AWS SNS IPN",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "paysim": "./dist/src/cli/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "paysim": "tsx src/cli/index.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
@@ -18,6 +22,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
   }

@@ -8,6 +8,7 @@ export interface MerchantServerOptions {
   logger?: boolean;
   paysimBaseUrl?: string;
   idToken?: string;
+  refreshToken?: string;
 }
 
 export function createMerchantDatabase(dbPath: string = ':memory:'): DatabaseType {
@@ -85,17 +86,23 @@ function extractIpnData(body: unknown): ParsedIpn {
 export function createMerchantServer(options: MerchantServerOptions = {}): {
   app: FastifyInstance;
   db: DatabaseType;
-  setPaysimConfig: (paysimBaseUrl: string, idToken: string) => void;
+  setPaysimConfig: (paysimBaseUrl: string, idToken: string, refreshToken?: string) => void;
+  getToken: () => string;
+  getRefreshToken: () => string;
 } {
   const db = createMerchantDatabase(options.dbPath ?? ':memory:');
   const app = Fastify({ logger: options.logger ?? false, forceCloseConnections: true });
 
   let paysimUrl = options.paysimBaseUrl ?? '';
   let token = options.idToken ?? '';
+  let refreshToken = options.refreshToken ?? '';
 
-  const setPaysimConfig = (newUrl: string, newToken: string) => {
+  const setPaysimConfig = (newUrl: string, newToken: string, newRefreshToken?: string) => {
     paysimUrl = newUrl;
     token = newToken;
+    if (newRefreshToken) {
+      refreshToken = newRefreshToken;
+    }
   };
 
   // Order management helpers
@@ -227,7 +234,7 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
         } | null = null;
 
         try {
-          const res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
+          let res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -236,6 +243,31 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
             body: JSON.stringify({ paymentID }),
             signal: AbortSignal.timeout(100)
           });
+
+          // Hardened auto-refresh: on HTTP 401, call /token/refresh and retry once
+          if (res.status === 401 && refreshToken) {
+            const refreshRes = await fetch(`${paysimUrl}/tokenized/checkout/token/refresh`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ refresh_token: refreshToken })
+            });
+            if (refreshRes.ok) {
+              const refreshData = (await refreshRes.json()) as { id_token?: string; statusCode?: string };
+              if (refreshData.statusCode === '0000' && refreshData.id_token) {
+                token = refreshData.id_token;
+                res = await fetch(`${paysimUrl}/tokenized/checkout/execute`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`
+                  },
+                  body: JSON.stringify({ paymentID }),
+                  signal: AbortSignal.timeout(100)
+                });
+              }
+            }
+          }
+
           executeResponse = await res.text();
           if (res.ok) {
             executeData = JSON.parse(executeResponse);
@@ -495,5 +527,68 @@ export function createMerchantServer(options: MerchantServerOptions = {}): {
     return reply.code(200).send({ status: 'ignored', type: messageType });
   });
 
-  return { app, db, setPaysimConfig };
+  // Endpoint to demonstrate checkout initiate with auto-refresh (Scenario 5)
+  app.post<{
+    Body: {
+      mode?: 'naive' | 'hardened';
+      amount: string;
+      orderId: string;
+      customerMsisdn?: string;
+      payerReference?: string;
+    };
+  }>('/checkout/create', async (req, reply) => {
+    const { mode = 'hardened', amount, orderId, customerMsisdn, payerReference } = req.body;
+
+    const makeCreateCall = async (currentToken: string) => {
+      return fetch(`${paysimUrl}/tokenized/checkout/create`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${currentToken}`,
+          'x-paysim-auto-approve': 'success'
+        },
+        body: JSON.stringify({
+          amount,
+          merchantInvoiceNumber: orderId,
+          payerReference: payerReference ?? `REF_${orderId}`,
+          customerMsisdn,
+          callbackURL: `${req.headers.host ? `http://${req.headers.host}` : ''}/bkash/callback/${mode}?orderId=${orderId}`
+        })
+      });
+    };
+
+    let res = await makeCreateCall(token);
+
+    if (res.status === 401 && mode === 'hardened' && refreshToken) {
+      const refreshRes = await fetch(`${paysimUrl}/tokenized/checkout/token/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken })
+      });
+      if (refreshRes.ok) {
+        const refreshData = (await refreshRes.json()) as { id_token?: string; statusCode?: string };
+        if (refreshData.statusCode === '0000' && refreshData.id_token) {
+          token = refreshData.id_token;
+          res = await makeCreateCall(token);
+        }
+      }
+    }
+
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+    return reply.code(res.status).send(data);
+  });
+
+  return {
+    app,
+    db,
+    setPaysimConfig,
+    getToken: () => token,
+    getRefreshToken: () => refreshToken
+  };
 }
