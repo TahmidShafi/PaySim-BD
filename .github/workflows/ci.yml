@@ -1,0 +1,44 @@
+name: PaySim-BD CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: Build, Typecheck, Test & Validate CLI
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [22.x]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck TypeScript (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Run test suite (vitest)
+        run: npm test
+
+      - name: Build production bundle & copy assets
+        run: npm run build
+
+      - name: Validate CLI entrypoint (--help)
+        run: node dist/src/cli/index.js --help
+
+      - name: Validate CLI linter command (--help)
+        run: node dist/src/cli/index.js lint --help

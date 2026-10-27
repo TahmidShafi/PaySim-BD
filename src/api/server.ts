@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { type Clock } from '../core/clock.js';
 import { parseAmountToPaisa, formatPaisaToAmountString } from '../core/paisa.js';
-import { transitionPayment, type PaymentStatus } from '../core/state-machine.js';
+import { transitionPayment, type PaymentStatus, type PaymentAction } from '../core/state-machine.js';
 import {
   insertPayment,
   getPaymentById,
@@ -148,9 +148,9 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
    */
   async function performWalletAction(
     paymentId: string,
-    actionInput?: 'approve' | 'fail' | 'cancel',
+    actionInput?: 'approve' | 'fail' | 'cancel' | 'expire',
     customerMsisdnInput?: string | null
-  ): Promise<{ action: 'approve' | 'fail' | 'cancel'; callbackStatus: 'success' | 'failure' | 'cancel'; statusCode: string }> {
+  ): Promise<{ action: 'approve' | 'fail' | 'cancel' | 'expire'; callbackStatus: 'success' | 'failure' | 'cancel'; statusCode: string }> {
     const payment = getPaymentById(db, paymentId);
     if (!payment) {
       throw new Error(`Payment with ID "${paymentId}" not found`);
@@ -158,7 +158,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
 
     const msisdn = customerMsisdnInput ?? payment.customer_msisdn ?? payment.payer_reference ?? '';
 
-    let action: 'approve' | 'fail' | 'cancel' = actionInput ?? 'approve';
+    let action: 'approve' | 'fail' | 'cancel' | 'expire' = actionInput ?? 'approve';
     let statusCode = '0000';
 
     // bKash sandbox test wallet automatic mapping
@@ -174,7 +174,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     }
 
     let callbackStatus: 'success' | 'failure' | 'cancel' = 'success';
-    let paymentAction: 'APPROVE_PAYMENT' | 'FAIL_PAYMENT' | 'CANCEL_PAYMENT' = 'APPROVE_PAYMENT';
+    let paymentAction: PaymentAction = 'APPROVE_PAYMENT';
 
     if (action === 'fail') {
       callbackStatus = 'failure';
@@ -182,6 +182,10 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     } else if (action === 'cancel') {
       callbackStatus = 'cancel';
       paymentAction = 'CANCEL_PAYMENT';
+    } else if (action === 'expire') {
+      callbackStatus = 'cancel';
+      paymentAction = 'EXPIRE_PAYMENT';
+      statusCode = '2026';
     }
 
     const transitionRes = transitionPayment(payment.status as PaymentStatus, paymentAction);
@@ -391,7 +395,7 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   // 5. POST /_paysim/checkout/:paymentID/action (Simulator wallet action)
   app.post<{
     Params: { paymentID: string };
-    Body: { action?: 'approve' | 'fail' | 'cancel'; customerMsisdn?: string };
+    Body: { action?: 'approve' | 'fail' | 'cancel' | 'expire'; customerMsisdn?: string };
   }>('/_paysim/checkout/:paymentID/action', async (req, reply) => {
     const { paymentID } = req.params;
     const payment = getPaymentById(db, paymentID);

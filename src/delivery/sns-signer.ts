@@ -6,15 +6,36 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export const DEFAULT_TEST_PRIVATE_KEY_PATH = path.join(__dirname, 'certs', 'test-key.pem');
-export const DEFAULT_TEST_CERT_PATH = path.join(__dirname, 'certs', 'test-cert.pem');
+export function resolveCertPath(filename: string): string {
+  const candidates = [
+    // 1. In same directory under certs/ (tsx runtime or copied dist)
+    path.join(__dirname, 'certs', filename),
+    // 2. Relative from compiled dist/src/delivery back to src/delivery/certs
+    path.join(__dirname, '..', '..', '..', 'src', 'delivery', 'certs', filename),
+    path.join(__dirname, '..', '..', 'src', 'delivery', 'certs', filename),
+    // 3. Current working directory
+    path.join(process.cwd(), 'src', 'delivery', 'certs', filename),
+    path.join(process.cwd(), 'dist', 'src', 'delivery', 'certs', filename)
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return path.join(__dirname, 'certs', filename);
+}
+
+export const DEFAULT_TEST_PRIVATE_KEY_PATH = resolveCertPath('test-key.pem');
+export const DEFAULT_TEST_CERT_PATH = resolveCertPath('test-cert.pem');
 
 export function loadDefaultTestPrivateKey(): string {
-  return fs.readFileSync(DEFAULT_TEST_PRIVATE_KEY_PATH, 'utf8');
+  return fs.readFileSync(resolveCertPath('test-key.pem'), 'utf8');
 }
 
 export function loadDefaultTestCertificate(): string {
-  return fs.readFileSync(DEFAULT_TEST_CERT_PATH, 'utf8');
+  return fs.readFileSync(resolveCertPath('test-cert.pem'), 'utf8');
 }
 
 export interface SnsNotificationFields {

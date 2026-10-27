@@ -8,7 +8,7 @@
     "paysim": "./dist/src/cli/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-assets.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "paysim": "tsx src/cli/index.ts"
