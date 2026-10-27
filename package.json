@@ -11,7 +11,9 @@
     "build": "tsc && node scripts/copy-assets.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "paysim": "tsx src/cli/index.ts"
+    "paysim": "npx tsx src/cli/index.ts",
+    "benchmark": "npx tsx scripts/benchmark.ts",
+    "demo": "npx tsx scripts/demo.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
