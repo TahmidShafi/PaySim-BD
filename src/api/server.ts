@@ -22,12 +22,16 @@ import {
   clearChaosRules,
   deleteChaosRule,
   telemetryBus,
+  insertRefund,
+  getTotalRefundedPaisa,
   type PaymentRecord,
   type ChaosRuleRecord,
   type OutboxItemParam,
-  type IpnOutboxRecord
+  type IpnOutboxRecord,
+  type RefundRecord
 } from '../storage/repositories.js';
 import { renderInspectorHtml } from './inspector.js';
+import { runFiveScenarioSuite } from './demo-runner.js';
 import { buildOutboxItems, type DuplicateChaosRule } from '../chaos/duplicate.js';
 import {
   applyOutboxChaosHooks,
@@ -100,6 +104,14 @@ const TriggerOfflineSchema = z.object({
   payerReference: z.string().optional()
 });
 
+const RefundPaymentSchema = z.object({
+  paymentID: z.string().min(1),
+  trxID: z.string().min(1),
+  amount: z.string().min(1),
+  sku: z.string().optional().nullable(),
+  reason: z.string().optional().nullable()
+});
+
 let trxSequence = 0;
 
 /**
@@ -124,6 +136,11 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   // Optional chaos rule toggle at runtime
   app.decorate('setChaosRule', (rule: DuplicateChaosRule | null) => {
     activeChaosRule = rule;
+  });
+
+  // Root URL redirect to Live Inspector dashboard
+  app.get('/', async (_req, reply) => {
+    return reply.redirect('/_paysim/inspector');
   });
 
   // Serve public X.509 certificate for SNS signature verification
@@ -686,6 +703,122 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     }
   );
 
+  // 7b. POST /tokenized/checkout/payment/refund (Full and Partial Refunds)
+  app.post(
+    '/tokenized/checkout/payment/refund',
+    { preHandler: verifyBearerToken },
+    async (req, reply) => {
+      const parseResult = RefundPaymentSchema.safeParse(req.body);
+      if (!parseResult.success) {
+        return reply.code(200).send({
+          statusCode: '2001',
+          statusMessage: 'Invalid refund parameters'
+        });
+      }
+
+      const { paymentID, trxID, amount, sku, reason } = parseResult.data;
+      const payment = getPaymentById(db, paymentID);
+      if (!payment) {
+        return reply.code(200).send({
+          statusCode: '2019',
+          statusMessage: 'Payment not found'
+        });
+      }
+
+      if (payment.status !== 'COMPLETED') {
+        return reply.code(200).send({
+          statusCode: '2062',
+          statusMessage: 'Payment is not in COMPLETED status'
+        });
+      }
+
+      if (payment.trx_id !== trxID) {
+        return reply.code(200).send({
+          statusCode: '2029',
+          statusMessage: 'Transaction ID does not match payment'
+        });
+      }
+
+      const refundPaisa = parseAmountToPaisa(amount);
+      const alreadyRefundedPaisa = getTotalRefundedPaisa(db, paymentID);
+
+      if (alreadyRefundedPaisa + refundPaisa > payment.amount_paisa) {
+        return reply.code(200).send({
+          statusCode: '2081',
+          statusMessage: 'Refund amount exceeds original transaction amount'
+        });
+      }
+
+      // bKash Action Point #5: Check if current token was redundantly granted when another valid token was still active
+      const authHeader = req.headers['authorization'];
+      const rawToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+      if (rawToken) {
+        const currentToken = getTokenById(db, rawToken);
+        if (currentToken) {
+          const priorValidToken = db
+            .prepare(`
+              SELECT id_token FROM tokens
+              WHERE revoked = 0
+                AND id_token != ?
+                AND issued_at <= ?
+                AND id_expires_at > ?
+              LIMIT 1
+            `)
+            .get(currentToken.id_token, currentToken.issued_at, currentToken.issued_at) as { id_token: string } | undefined;
+
+          if (priorValidToken) {
+            insertEvent(db, {
+              ts: clock.nowMs(),
+              kind: 'UAT_RULE_5_REFUND_TOKEN_MISMATCH',
+              payment_id: payment.payment_id,
+              request: JSON.stringify(req.body ?? {}),
+              response: JSON.stringify({
+                message:
+                  'Violated UAT Action Point #5: Refund requested with re-granted id_token instead of reusing original active token.'
+              })
+            });
+          }
+        }
+      }
+
+      const refundTrxId = generateDeterministicTrxId(`refund-${paymentID}-${alreadyRefundedPaisa + refundPaisa}`);
+      const refundRecord: RefundRecord = {
+        refund_trx_id: refundTrxId,
+        payment_id: paymentID,
+        original_trx_id: trxID,
+        amount_paisa: refundPaisa,
+        sku: sku ?? null,
+        reason: reason ?? null,
+        created_at: clock.nowMs()
+      };
+
+      insertRefund(db, refundRecord);
+
+      insertEvent(db, {
+        ts: clock.nowMs(),
+        kind: 'PAYMENT_REFUNDED',
+        payment_id: paymentID,
+        request: JSON.stringify(req.body),
+        response: JSON.stringify({
+          statusCode: '0000',
+          refundTrxID: refundTrxId,
+          amount: formatPaisaToAmountString(refundPaisa)
+        })
+      });
+
+      return reply.code(200).send({
+        statusCode: '0000',
+        statusMessage: 'Successful',
+        originalTrxID: trxID,
+        refundTrxID: refundTrxId,
+        transactionStatus: 'Completed',
+        amount: formatPaisaToAmountString(refundPaisa),
+        currency: payment.currency ?? 'BDT',
+        completedTime: clock.nowIso()
+      });
+    }
+  );
+
   // 8. POST /_paysim/webhooks/register (AWS SNS SubscriptionConfirmation Handshake)
   app.post('/_paysim/webhooks/register', async (req, reply) => {
     const parseResult = RegisterWebhookSchema.safeParse(req.body);
@@ -1045,6 +1178,26 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
   // 18. GET /_paysim/inspector (Single-file embedded UI)
   app.get('/_paysim/inspector', async (_req, reply) => {
     return reply.type('text/html').send(renderInspectorHtml());
+  });
+
+  // 19. POST /_paysim/demo/run-suite (Execute all 5 MVP Chaos Scenarios live against in-process demo merchant)
+  app.post('/_paysim/demo/run-suite', async (req, reply) => {
+    const host = req.headers.host ?? '127.0.0.1';
+    const protocol = req.protocol ?? 'http';
+    const simBaseUrl = `${protocol}://${host}`;
+
+    const results = await runFiveScenarioSuite({
+      simBaseUrl,
+      simDb: db,
+      clock,
+      workerEvents
+    });
+
+    return reply.code(200).send({
+      success: true,
+      timestamp: clock.nowIso(),
+      results
+    });
   });
 
   return app;

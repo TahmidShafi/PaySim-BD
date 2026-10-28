@@ -471,3 +471,42 @@ export function deleteChaosRule(db: DatabaseType, id: string): void {
   db.prepare('DELETE FROM chaos_rules WHERE id = ?').run(id);
 }
 
+export interface RefundRecord {
+  refund_trx_id: string;
+  payment_id: string;
+  original_trx_id: string;
+  amount_paisa: number;
+  sku?: string | null;
+  reason?: string | null;
+  created_at: number;
+}
+
+export function insertRefund(db: DatabaseType, refund: RefundRecord): void {
+  const stmt = db.prepare(`
+    INSERT INTO refunds (refund_trx_id, payment_id, original_trx_id, amount_paisa, sku, reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    refund.refund_trx_id,
+    refund.payment_id,
+    refund.original_trx_id,
+    refund.amount_paisa,
+    refund.sku ?? null,
+    refund.reason ?? null,
+    refund.created_at
+  );
+}
+
+export function getRefundsByPaymentId(db: DatabaseType, paymentId: string): RefundRecord[] {
+  const stmt = db.prepare('SELECT * FROM refunds WHERE payment_id = ? ORDER BY created_at ASC');
+  return stmt.all(paymentId) as RefundRecord[];
+}
+
+export function getTotalRefundedPaisa(db: DatabaseType, paymentId: string): number {
+  const row = db
+    .prepare('SELECT COALESCE(SUM(amount_paisa), 0) as total FROM refunds WHERE payment_id = ?')
+    .get(paymentId) as { total: number };
+  return row.total;
+}
+
+

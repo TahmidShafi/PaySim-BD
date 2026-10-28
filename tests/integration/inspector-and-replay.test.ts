@@ -84,6 +84,11 @@ describe('v1.1.0 Integration Suite: Live Inspector, Real-Time SSE & Webhook Repl
   });
 
   it('Test 1: GET /_paysim/inspector and GET /_paysim/state snapshot integrity', async () => {
+    // 0. Verify Root GET / redirects to /_paysim/inspector
+    const rootRes = await fetch(`${simBaseUrl}/`, { redirect: 'manual' });
+    expect(rootRes.status).toBe(302);
+    expect(rootRes.headers.get('location')).toBe('/_paysim/inspector');
+
     // 1. Verify HTML Inspector endpoint
     const htmlRes = await fetch(`${simBaseUrl}/_paysim/inspector`);
     expect(htmlRes.status).toBe(200);

@@ -3,7 +3,8 @@ import { type Database as DatabaseType } from 'better-sqlite3';
 export type UatRuleKind =
   | 'UAT_RULE_1_REDUNDANT_TOKEN_GRANT'
   | 'UAT_RULE_2_EXECUTE_WITHOUT_SUCCESS_CALLBACK'
-  | 'UAT_RULE_4_UNNECESSARY_QUERY_STATUS';
+  | 'UAT_RULE_4_UNNECESSARY_QUERY_STATUS'
+  | 'UAT_RULE_5_REFUND_TOKEN_MISMATCH';
 
 export interface UatViolationReport {
   id: number;
@@ -45,6 +46,14 @@ export const UAT_RULE_METADATA: Record<
       'Query payment (/tokenized/checkout/payment/status) was invoked after execute API already returned a successful response without timeout. In bKash protocol, query payment should only be called if there is no response from execute API.',
     remediation:
       'Remove /tokenized/checkout/payment/status from the standard payment flow. Only invoke it inside error/timeout catch blocks when /execute fails or times out.'
+  },
+  UAT_RULE_5_REFUND_TOKEN_MISMATCH: {
+    actionPoint: 'Action Point #5',
+    title: 'Redundant Token Grant Before Refund (id_token not reused)',
+    description:
+      'bKash requires merchants to reuse the issued id_token for both payment checkout and subsequent refund requests for its 1-hour TTL. A new token was requested before refunding while a valid unexpired token already existed.',
+    remediation:
+      'Reuse the active id_token for refund operations. Do not invoke /tokenized/checkout/token/grant prior to /tokenized/checkout/payment/refund.'
   }
 };
 

@@ -221,13 +221,37 @@ $ npx paysim start --port 8080 --db ./paysim.db
 ### 2. Embedded Live HTML Inspector (`/_paysim/inspector`)
 
 PaySim-BD features a single-file, zero-dependency dark-mode dashboard served directly at `http://127.0.0.1:8080/_paysim/inspector`:
+- **In-Browser 5-Scenario Chaos Suite Runner:** Click **"▶ Run All 5 Chaos Scenarios"** to trigger in-process verification of all 5 failure modes against a demo merchant, streaming events live over SSE and rendering a color-coded Naive vs. Hardened architecture comparison matrix directly in the browser.
 - **Real-Time Telemetry Stream:** Consumes `GET /_paysim/events/stream` via Server-Sent Events (SSE) with live connection health indicator.
 - **KPI Summary Cards:** Instant stats on Total Payments, Completed Payments, Outbox Delivery status (`DELIVERED`, `PENDING`, `RETRY`, `DEAD`), and UAT Violations.
 - **One-Click Webhook Replay:** Interactively replay any previously delivered or dead IPN webhook to verify idempotency and duplicate deduplication in your application.
 - **Simulate Offline Payments:** Quick buttons to trigger bKash USSD (`*247#`, `transactionType: 10002175`) or Merchant QR (`transactionType: 10003126`) payments.
 - **UAT Compliance Audit Tab:** Real-time visibility into technical acceptance rule violations and remediation recommendations.
 
-### 3. `paysim events`
+### 3. Full & Partial Refund API (`/tokenized/checkout/payment/refund`)
+
+Implements bKash's official refund specification with exact integer paisa arithmetic and technical acceptance guardrails:
+```bash
+POST /tokenized/checkout/payment/refund
+Authorization: Bearer <id_token>
+Content-Type: application/json
+
+{
+  "paymentID": "TR0011B4FAEFD5314B40",
+  "trxID": "BK7F3A9D1E",
+  "amount": "250.00",
+  "sku": "SKU-PROD-01",
+  "reason": "Customer cancellation"
+}
+```
+- **Cumulative Ledger:** Supports multiple partial refunds up to the exact payment amount.
+- **Over-Refund Protection:** If `alreadyRefunded + refundAmount > originalAmount`, returns official bKash envelope:
+  ```json
+  { "statusCode": "2081", "statusMessage": "Refund amount exceeds original transaction amount" }
+  ```
+- **UAT Action Point #5 Audit:** Flags `UAT_RULE_5_REFUND_TOKEN_MISMATCH` if a merchant generates a redundant token for the refund rather than reusing the active 1-hour `id_token`.
+
+### 4. `paysim events`
 
 Renders a chronological ASCII table of all state transitions, API calls, and chaos injections for a payment:
 ```bash
@@ -244,7 +268,7 @@ $ npx paysim events TR0011B4FAEFD5314B40 --db ./paysim.db
 ---------------------------------------------------------------------------------------------------------
 ```
 
-### 4. `paysim lint`
+### 5. `paysim lint`
 
 Audits the database for any bKash UAT compliance violations. Exits with code `1` if violations are found (ideal as a CI gate for integration testing):
 ```bash
@@ -277,15 +301,39 @@ $ npx paysim lint --db ./paysim.db
 
 ---
 
+## 🐳 Docker & Free Cloud Deployment
+
+PaySim-BD is fully containerized and ready for one-click deployment to any container platform or Render's Free Web Service tier.
+
+### 1. Run Locally with Docker
+
+```bash
+# Build production multi-stage image
+docker build -t paysim-bd .
+
+# Run container on port 8080 with persistent SQLite volume
+docker run -p 8080:8080 -v paysim-data:/data paysim-bd
+```
+Access the Live Inspector at `http://localhost:8080/_paysim/inspector`.
+
+### 2. Deploy Free on Render (`render.yaml`)
+
+This repository includes a pre-configured [`render.yaml`](render.yaml) blueprint:
+1. Fork or push this repository to GitHub.
+2. In the [Render Dashboard](https://dashboard.render.com/), click **New** ➔ **Blueprint** and select your repository.
+3. Render automatically provisions a Docker Web Service on the Free plan, mounts the health check (`/_paysim/state`), and provisions a public HTTPS URL with no credit card required.
+
+---
+
 ## 🛠️ Testing & Verification
 
-PaySim-BD is verified with 13 comprehensive unit, integration, and failure resilience test suites:
+PaySim-BD is verified with 14 comprehensive unit, integration, and failure resilience test suites:
 
 ```bash
 # Typecheck TypeScript codebase
 npx tsc --noEmit
 
-# Run all 77 Vitest tests
+# Run all 79 Vitest tests
 npm test
 
 # Build production bundle and copy certificate assets

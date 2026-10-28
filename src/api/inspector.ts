@@ -110,17 +110,25 @@ export function renderInspectorHtml(): string {
       </div>
     </div>
 
-    <!-- Action Toolbar (Trigger Offline & Clock Advance) -->
+    <!-- Action Toolbar (Trigger Offline, Clock Advance & Chaos Suite Runner) -->
     <div class="bg-slate-850 rounded-xl p-4 border border-slate-800 flex flex-wrap items-center justify-between gap-4">
       <div class="flex flex-wrap items-center gap-3">
-        <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Simulate Offline:</span>
+        <button onclick="runAllChaosScenarios()" id="btn-run-suite" class="px-4 py-2 rounded-xl bg-gradient-to-r from-brand to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white font-bold text-xs shadow-lg shadow-pink-900/40 flex items-center space-x-2 transition transform active:scale-95">
+          <span id="suite-spinner" class="hidden animate-spin">🔄</span>
+          <span id="suite-icon">▶</span>
+          <span id="suite-label">Run All 5 Chaos Scenarios</span>
+        </button>
+
+        <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider hidden sm:inline">|</span>
+
+        <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Offline:</span>
         <button onclick="triggerOffline('ussd')" class="px-3 py-1.5 rounded-lg bg-pink-600/20 hover:bg-pink-600/30 text-pink-300 border border-pink-500/30 text-xs font-medium flex items-center space-x-1.5 transition">
           <span>📱</span>
-          <span>Trigger USSD (*247#)</span>
+          <span>USSD (*247#)</span>
         </button>
         <button onclick="triggerOffline('qr')" class="px-3 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/30 text-xs font-medium flex items-center space-x-1.5 transition">
           <span>📷</span>
-          <span>Trigger Merchant QR</span>
+          <span>QR Payment</span>
         </button>
       </div>
 
@@ -130,6 +138,33 @@ export function renderInspectorHtml(): string {
         <button onclick="advanceClock(60)" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-mono transition">+1m</button>
         <button onclick="advanceClock(3600)" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-mono transition">+1h</button>
         <button onclick="advanceClock(86400)" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-mono transition">+24h</button>
+      </div>
+    </div>
+
+    <!-- 5-Scenario Live Showcase Comparison Card -->
+    <div id="suite-results-card" class="hidden bg-slate-850 rounded-xl p-5 border border-pink-700/50 shadow-xl space-y-4">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center space-x-3">
+          <span class="text-sm font-bold text-white">5-Scenario Chaos Matrix Verification</span>
+          <span id="suite-status-pill" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-300 border border-emerald-700">5/5 Verified</span>
+        </div>
+        <button onclick="document.getElementById('suite-results-card').classList.add('hidden')" class="text-slate-400 hover:text-white text-xs">✕ Dismiss</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs">
+          <thead class="bg-slate-900 text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-700">
+            <tr>
+              <th class="p-3 w-12">#</th>
+              <th class="p-3">Scenario</th>
+              <th class="p-3">Injected Chaos Fault</th>
+              <th class="p-3">Naive Result (Vulnerable)</th>
+              <th class="p-3">Hardened Result (Resilient)</th>
+              <th class="p-3 text-right">Status</th>
+            </tr>
+          </thead>
+          <tbody id="suite-table-body" class="divide-y divide-slate-800">
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -419,6 +454,68 @@ export function renderInspectorHtml(): string {
       } catch (err) {
         showToast('Error replaying outbox: ' + err.message, 'error');
       }
+    }
+
+    async function runAllChaosScenarios() {
+      const btn = document.getElementById('btn-run-suite');
+      const spinner = document.getElementById('suite-spinner');
+      const icon = document.getElementById('suite-icon');
+      const label = document.getElementById('suite-label');
+
+      btn.disabled = true;
+      btn.classList.add('opacity-75');
+      spinner.classList.remove('hidden');
+      icon.classList.add('hidden');
+      label.textContent = 'Executing 5 Scenarios...';
+      showToast('Executing all 5 chaos scenarios against live demo merchant...', 'success');
+
+      try {
+        const res = await fetch('/_paysim/demo/run-suite', { method: 'POST' });
+        const data = await res.json();
+        if (data.success && data.results) {
+          renderSuiteResults(data.results);
+          showToast('Completed! All 5 Scenarios verified Naive vs. Hardened architecture.', 'success');
+          await fetchState();
+        } else {
+          showToast('Failed to run suite: ' + (data.error || 'Unknown error'), 'error');
+        }
+      } catch (err) {
+        showToast('Error running suite: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.classList.remove('opacity-75');
+        spinner.classList.add('hidden');
+        icon.classList.remove('hidden');
+        label.textContent = 'Run All 5 Chaos Scenarios';
+      }
+    }
+
+    function renderSuiteResults(results) {
+      const container = document.getElementById('suite-results-card');
+      const tbody = document.getElementById('suite-table-body');
+      const pill = document.getElementById('suite-status-pill');
+
+      const allPassed = results.every(r => r.passed);
+      pill.textContent = (results.filter(r => r.passed).length) + '/' + results.length + ' Verified';
+      pill.className = allPassed
+        ? 'px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-300 border border-emerald-700'
+        : 'px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-950 text-amber-300 border border-amber-700';
+
+      tbody.innerHTML = results.map(r => {
+        return '<tr class="hover:bg-slate-800/40 transition">' +
+          '<td class="p-3 font-mono font-bold text-slate-400">#' + r.scenario + '</td>' +
+          '<td class="p-3 font-semibold text-white">' + escapeHtml(r.name) + '</td>' +
+          '<td class="p-3 font-mono text-slate-300">' + escapeHtml(r.chaosFault) + '</td>' +
+          '<td class="p-3 text-rose-400 font-mono text-[11px]">' + escapeHtml(r.naiveResult) + '</td>' +
+          '<td class="p-3 text-emerald-400 font-mono text-[11px]">' + escapeHtml(r.hardenedResult) + '</td>' +
+          '<td class="p-3 text-right"><span class="px-2 py-0.5 rounded text-[10px] font-bold ' +
+            (r.passed ? 'bg-emerald-950 text-emerald-300 border border-emerald-700' : 'bg-rose-950 text-rose-300 border border-rose-700') +
+          '">' + (r.passed ? 'PASS' : 'FAIL') + '</span></td>' +
+        '</tr>';
+      }).join('');
+
+      container.classList.remove('hidden');
+      container.scrollIntoView({ behavior: 'smooth' });
     }
 
     async function triggerOffline(channel) {

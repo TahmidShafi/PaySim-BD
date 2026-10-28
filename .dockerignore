@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+*.db
+*.db-shm
+*.db-wal
+.env
+coverage
+tests
+scripts/benchmark.ts
+scripts/demo.ts
+

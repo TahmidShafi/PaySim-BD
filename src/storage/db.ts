@@ -68,9 +68,21 @@ export function runMigrations(db: DatabaseType): void {
       confirmed_at INTEGER
     );
 
+    CREATE TABLE IF NOT EXISTS refunds (
+      refund_trx_id TEXT PRIMARY KEY,
+      payment_id TEXT NOT NULL,
+      original_trx_id TEXT NOT NULL,
+      amount_paisa INTEGER NOT NULL,
+      sku TEXT,
+      reason TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(payment_id) REFERENCES payments(payment_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_payments_trx_id ON payments(trx_id);
     CREATE INDEX IF NOT EXISTS idx_ipn_outbox_status ON ipn_outbox(status, next_attempt_at);
     CREATE INDEX IF NOT EXISTS idx_events_payment_id ON events(payment_id);
+    CREATE INDEX IF NOT EXISTS idx_refunds_payment_id ON refunds(payment_id);
   `);
 }
 

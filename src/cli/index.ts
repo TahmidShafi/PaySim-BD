@@ -17,7 +17,7 @@ const program = new Command();
 program
   .name('paysim')
   .description('PaySim-BD: Local CLI and chaos webhook simulator for bKash Checkout and AWS SNS IPN')
-  .version('1.1.0');
+  .version('1.2.0');
 
 // 1. paysim start [--port 8080] [--db ./paysim.db]
 program
