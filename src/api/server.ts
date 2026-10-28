@@ -21,10 +21,13 @@ import {
   getChaosRules,
   clearChaosRules,
   deleteChaosRule,
+  telemetryBus,
   type PaymentRecord,
   type ChaosRuleRecord,
-  type OutboxItemParam
+  type OutboxItemParam,
+  type IpnOutboxRecord
 } from '../storage/repositories.js';
+import { renderInspectorHtml } from './inspector.js';
 import { buildOutboxItems, type DuplicateChaosRule } from '../chaos/duplicate.js';
 import {
   applyOutboxChaosHooks,
@@ -88,6 +91,13 @@ const ChaosRuleInputSchema = z.object({
   params: z.record(z.unknown()).optional(),
   params_json: z.string().optional(),
   seed: z.number().optional().nullable()
+});
+
+const TriggerOfflineSchema = z.object({
+  channel: z.enum(['ussd', 'qr']),
+  amount: z.string(),
+  merchantInvoiceNumber: z.string().optional(),
+  payerReference: z.string().optional()
 });
 
 let trxSequence = 0;
@@ -814,6 +824,228 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       });
     }
   );
+
+  // 14. GET /_paysim/state (JSON snapshot of system state)
+  app.get('/_paysim/state', async (_req, reply) => {
+    const totalPayments = (db.prepare('SELECT COUNT(*) as c FROM payments').get() as { c: number }).c;
+    const completedPayments = (db.prepare("SELECT COUNT(*) as c FROM payments WHERE status = 'COMPLETED'").get() as { c: number }).c;
+    const outboxPending = (db.prepare("SELECT COUNT(*) as c FROM ipn_outbox WHERE status = 'PENDING'").get() as { c: number }).c;
+    const outboxRetry = (db.prepare("SELECT COUNT(*) as c FROM ipn_outbox WHERE status = 'RETRY'").get() as { c: number }).c;
+    const outboxDelivered = (db.prepare("SELECT COUNT(*) as c FROM ipn_outbox WHERE status = 'DELIVERED'").get() as { c: number }).c;
+    const outboxDead = (db.prepare("SELECT COUNT(*) as c FROM ipn_outbox WHERE status = 'DEAD'").get() as { c: number }).c;
+    const totalViolations = (db.prepare("SELECT COUNT(*) as c FROM events WHERE kind LIKE 'UAT_RULE_%'").get() as { c: number }).c;
+
+    const payments = db.prepare('SELECT * FROM payments ORDER BY created_at DESC, rowid DESC LIMIT 50').all();
+    const outbox = db.prepare('SELECT * FROM ipn_outbox ORDER BY id DESC LIMIT 50').all();
+    const events = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 100').all();
+    const violations = checkUatViolations(db);
+
+    return reply.code(200).send({
+      summary: {
+        total_payments: totalPayments,
+        completed_payments: completedPayments,
+        outbox_pending: outboxPending,
+        outbox_retry: outboxRetry,
+        outbox_delivered: outboxDelivered,
+        outbox_dead: outboxDead,
+        total_violations: totalViolations
+      },
+      payments,
+      outbox,
+      events,
+      violations
+    });
+  });
+
+  // 15. GET /_paysim/events/stream (Server-Sent Events real-time telemetry stream)
+  app.get('/_paysim/events/stream', async (req, reply) => {
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    reply.raw.write(': connected\n\n');
+
+    const onEvent = (event: unknown) => {
+      try {
+        reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {
+        // Stream may have closed
+      }
+    };
+
+    telemetryBus.on('event', onEvent);
+
+    await new Promise<void>((resolve) => {
+      req.raw.on('close', () => {
+        telemetryBus.off('event', onEvent);
+        resolve();
+      });
+    });
+  });
+
+  // 16. POST /_paysim/outbox/:id/replay (Deterministic webhook redelivery)
+  app.post<{ Params: { id: string } }>('/_paysim/outbox/:id/replay', async (req, reply) => {
+    const idNum = parseInt(req.params.id, 10);
+    if (isNaN(idNum)) {
+      return reply.code(400).send({ error: 'Invalid outbox ID' });
+    }
+
+    const orig = db.prepare('SELECT * FROM ipn_outbox WHERE id = ?').get(idNum) as IpnOutboxRecord | undefined;
+    if (!orig) {
+      return reply.code(404).send({ error: 'Outbox item not found' });
+    }
+
+    const insertStmt = db.prepare(`
+      INSERT INTO ipn_outbox (
+        payment_id, sns_message_id, sns_type, payload, signature,
+        attempts, next_attempt_at, locked_until, status
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, 0, 'PENDING')
+    `);
+
+    const result = insertStmt.run(
+      orig.payment_id,
+      orig.sns_message_id,
+      orig.sns_type,
+      orig.payload,
+      orig.signature,
+      clock.nowMs()
+    );
+
+    const newOutboxId = Number(result.lastInsertRowid);
+
+    insertEvent(db, {
+      ts: clock.nowMs(),
+      kind: 'IPN_REPLAY_TRIGGERED',
+      payment_id: orig.payment_id,
+      request: JSON.stringify({ originalOutboxId: idNum }),
+      response: JSON.stringify({ newOutboxId, status: 'PENDING' })
+    });
+
+    if (workerEvents) {
+      workerEvents.emit('wake');
+    }
+
+    return reply.code(200).send({
+      success: true,
+      originalId: idNum,
+      newOutboxId
+    });
+  });
+
+  // 17. POST /_paysim/trigger/offline (Simulated USSD *247# or Merchant QR Payment)
+  app.post('/_paysim/trigger/offline', async (req, reply) => {
+    const parseResult = TriggerOfflineSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return reply.code(400).send({
+        error: 'Invalid offline payment parameters',
+        details: parseResult.error.issues
+      });
+    }
+
+    const { channel, amount, merchantInvoiceNumber, payerReference } = parseResult.data;
+    const amountPaisa = parseAmountToPaisa(amount);
+    const amountStr = formatPaisaToAmountString(amountPaisa);
+
+    // Verified bKash transactionType codes
+    const transactionType = channel === 'ussd' ? '10002175' : '10003126';
+    const nowMs = clock.nowMs();
+    const nowIso = clock.nowIso();
+
+    const trxId = generateDeterministicTrxId(`offline-${nowMs}`);
+    const paymentId = `OFFLINE-${channel.toUpperCase()}-${nowMs}`;
+    const invoice = merchantInvoiceNumber ?? `INV-OFFLINE-${nowMs}`;
+    const payerRef = payerReference ?? '01700000000';
+
+    // Insert completed payment record
+    insertPayment(db, {
+      payment_id: paymentId,
+      invoice,
+      amount_paisa: amountPaisa,
+      currency: 'BDT',
+      mode: '0011',
+      intent: transactionType,
+      payer_reference: payerRef,
+      customer_msisdn: payerRef,
+      callback_url: '',
+      status: 'COMPLETED',
+      trx_id: trxId,
+      created_at: nowMs,
+      updated_at: nowMs
+    });
+
+    // Construct inner AWS SNS notification message
+    const innerMessage = JSON.stringify({
+      dateTime: nowIso,
+      debitMSISDN: payerRef,
+      amount: amountStr,
+      currency: 'BDT',
+      trxID: trxId,
+      transactionStatus: 'Completed',
+      merchantInvoiceNumber: invoice,
+      paymentID: paymentId,
+      payerReference: payerRef,
+      transactionType
+    });
+
+    const host = req.headers.host ?? '127.0.0.1';
+    const signingCertUrl = `http://${host}/.well-known/paysim-sns.pem`;
+
+    const signedNotification = createSignedNotificationEnvelope(
+      {
+        Type: 'Notification',
+        MessageId: crypto.randomUUID(),
+        TopicArn: 'arn:aws:sns:ap-southeast-1:000000000000:bkash-ipn',
+        Subject: 'bKash Payment Notification',
+        Message: innerMessage,
+        Timestamp: nowIso
+      },
+      signingCertUrl
+    );
+
+    const payload = JSON.stringify(signedNotification);
+
+    // Insert into ipn_outbox
+    const outboxResult = db.prepare(`
+      INSERT INTO ipn_outbox (
+        payment_id, sns_message_id, sns_type, payload, signature,
+        attempts, next_attempt_at, locked_until, status
+      ) VALUES (?, ?, 'Notification', ?, ?, 0, ?, 0, 'PENDING')
+    `).run(
+      paymentId,
+      signedNotification.MessageId,
+      payload,
+      signedNotification.Signature,
+      nowMs
+    );
+
+    const outboxId = Number(outboxResult.lastInsertRowid);
+
+    insertEvent(db, {
+      ts: nowMs,
+      kind: 'OFFLINE_PAYMENT_TRIGGERED',
+      payment_id: paymentId,
+      request: JSON.stringify(req.body),
+      response: JSON.stringify({ trxId, transactionType, outboxId })
+    });
+
+    if (workerEvents) {
+      workerEvents.emit('wake');
+    }
+
+    return reply.code(200).send({
+      success: true,
+      channel,
+      trxID: trxId,
+      paymentId,
+      outboxId
+    });
+  });
+
+  // 18. GET /_paysim/inspector (Single-file embedded UI)
+  app.get('/_paysim/inspector', async (_req, reply) => {
+    return reply.type('text/html').send(renderInspectorHtml());
+  });
 
   return app;
 }

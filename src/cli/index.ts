@@ -17,7 +17,7 @@ const program = new Command();
 program
   .name('paysim')
   .description('PaySim-BD: Local CLI and chaos webhook simulator for bKash Checkout and AWS SNS IPN')
-  .version('1.0.0');
+  .version('1.1.0');
 
 // 1. paysim start [--port 8080] [--db ./paysim.db]
 program
@@ -55,6 +55,7 @@ program
     console.log('                PaySim-BD: bKash Tokenized Checkout Simulator                   ');
     console.log('================================================================================');
     console.log(` Simulator URL:    ${address}`);
+    console.log(` Live Inspector:   ${address}/_paysim/inspector`);
     console.log(` SQLite Database:  ${dbPath}`);
     console.log(` SNS Public Cert:  ${address}/.well-known/paysim-sns.pem`);
     console.log(` UAT Violations:   ${address}/_paysim/linter/violations`);

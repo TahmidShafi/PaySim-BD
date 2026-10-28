@@ -206,16 +206,28 @@ Starts the HTTP simulator server and the background IPN delivery worker:
 ```bash
 $ npx paysim start --port 8080 --db ./paysim.db
 
-======================================================================
-  PaySim-BD: bKash Tokenized Checkout & AWS SNS IPN Simulator v0.1.0  
-======================================================================
-Database:  ./paysim.db (WAL Mode)
-HTTP Host: http://127.0.0.1:8080
-Cert URL:  http://127.0.0.1:8080/.well-known/paysim-sns.pem
-Worker:    Started (Lease: 30000ms, Max Attempts: 5)
+================================================================================
+                PaySim-BD: bKash Tokenized Checkout Simulator                   
+================================================================================
+ Simulator URL:    http://127.0.0.1:8080
+ Live Inspector:   http://127.0.0.1:8080/_paysim/inspector
+ SQLite Database:  ./paysim.db
+ SNS Public Cert:  http://127.0.0.1:8080/.well-known/paysim-sns.pem
+ UAT Violations:   http://127.0.0.1:8080/_paysim/linter/violations
+ Outbox Worker:    Active (Concurrency: Promise.all, Lease: 30s)
+================================================================================
 ```
 
-### 2. `paysim events`
+### 2. Embedded Live HTML Inspector (`/_paysim/inspector`)
+
+PaySim-BD features a single-file, zero-dependency dark-mode dashboard served directly at `http://127.0.0.1:8080/_paysim/inspector`:
+- **Real-Time Telemetry Stream:** Consumes `GET /_paysim/events/stream` via Server-Sent Events (SSE) with live connection health indicator.
+- **KPI Summary Cards:** Instant stats on Total Payments, Completed Payments, Outbox Delivery status (`DELIVERED`, `PENDING`, `RETRY`, `DEAD`), and UAT Violations.
+- **One-Click Webhook Replay:** Interactively replay any previously delivered or dead IPN webhook to verify idempotency and duplicate deduplication in your application.
+- **Simulate Offline Payments:** Quick buttons to trigger bKash USSD (`*247#`, `transactionType: 10002175`) or Merchant QR (`transactionType: 10003126`) payments.
+- **UAT Compliance Audit Tab:** Real-time visibility into technical acceptance rule violations and remediation recommendations.
+
+### 3. `paysim events`
 
 Renders a chronological ASCII table of all state transitions, API calls, and chaos injections for a payment:
 ```bash
@@ -232,7 +244,7 @@ $ npx paysim events TR0011B4FAEFD5314B40 --db ./paysim.db
 ---------------------------------------------------------------------------------------------------------
 ```
 
-### 3. `paysim lint`
+### 4. `paysim lint`
 
 Audits the database for any bKash UAT compliance violations. Exits with code `1` if violations are found (ideal as a CI gate for integration testing):
 ```bash
@@ -267,13 +279,13 @@ $ npx paysim lint --db ./paysim.db
 
 ## 🛠️ Testing & Verification
 
-PaySim-BD is verified with 12 comprehensive unit, integration, and failure resilience test suites:
+PaySim-BD is verified with 13 comprehensive unit, integration, and failure resilience test suites:
 
 ```bash
 # Typecheck TypeScript codebase
 npx tsc --noEmit
 
-# Run all 73 Vitest tests
+# Run all 77 Vitest tests
 npm test
 
 # Build production bundle and copy certificate assets

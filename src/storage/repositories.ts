@@ -1,4 +1,8 @@
 import { type Database as DatabaseType } from 'better-sqlite3';
+import { EventEmitter } from 'node:events';
+
+export const telemetryBus = new EventEmitter();
+telemetryBus.setMaxListeners(100);
 
 export interface PaymentRecord {
   payment_id: string;
@@ -105,7 +109,7 @@ export function insertEvent(db: DatabaseType, event: EventRecord): void {
     INSERT INTO events (ts, kind, payment_id, request, response, chaos_applied)
     VALUES (?, ?, ?, ?, ?, ?)
   `);
-  stmt.run(
+  const result = stmt.run(
     event.ts,
     event.kind,
     event.payment_id ?? null,
@@ -113,6 +117,7 @@ export function insertEvent(db: DatabaseType, event: EventRecord): void {
     event.response ?? null,
     event.chaos_applied ?? null
   );
+  telemetryBus.emit('event', { ...event, id: Number(result.lastInsertRowid) });
 }
 
 export function insertPayment(db: DatabaseType, payment: PaymentRecord): void {
@@ -242,6 +247,17 @@ export function atomicExecutePaymentWithOutbox(
   });
 
   txn.immediate();
+
+  if (params.event) {
+    telemetryBus.emit('event', {
+      ts: params.updatedAt,
+      kind: params.event.kind,
+      payment_id: params.paymentId,
+      request: params.event.request ?? null,
+      response: params.event.response ?? null,
+      chaos_applied: params.event.chaos_applied ?? null
+    });
+  }
 }
 
 export function getOutboxItemsByPaymentId(
