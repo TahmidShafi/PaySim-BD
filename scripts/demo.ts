@@ -19,6 +19,16 @@ const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+function padAnsi(s: string, width: number): string {
+  const visibleLen = stripAnsi(s).length;
+  const pad = Math.max(0, width - visibleLen);
+  return s + ' '.repeat(pad);
+}
+
 interface DemoRow {
   num: number;
   name: string;
@@ -154,6 +164,7 @@ async function runDemo() {
       })
     });
     const { paymentID: pidH } = (await crH.json()) as { paymentID: string };
+    samplePaymentId = pidH;
 
     await fetch(`${simUrl}/_paysim/checkout/${pidH}/action`, {
       method: 'POST',
@@ -315,7 +326,6 @@ async function runDemo() {
       })
     });
     const { paymentID: pidN } = (await crN.json()) as { paymentID: string };
-    samplePaymentId = pidN;
 
     await new Promise((r) => setTimeout(r, 300));
     const resN = (await (await fetch(`${merchantBaseUrl}/orders/${ordN}`)).json()) as any;
@@ -349,7 +359,7 @@ async function runDemo() {
     demoRows.push({
       num: 3,
       name: '/execute Timeout & Recovery',
-      fault: 'timeout-after-commit (504)',
+      fault: 'timeout-after-commit',
       naive: red(`Lost Funds (Status: ${resN.status}, 0 BDT)`),
       hardened: green(`Recovered via /status (500 BDT)`)
     });
@@ -401,7 +411,7 @@ async function runDemo() {
     demoRows.push({
       num: 4,
       name: 'Forged SNS Signature',
-      fault: 'tamper-amount (99,999.00 BDT)',
+      fault: 'tamper-amount (99,999)',
       naive: red(`Accepted Spoofed Webhook (HTTP ${resN.status})`),
       hardened: green(`Rejected Signature Mismatch (HTTP ${resH.status})`)
     });
@@ -440,17 +450,18 @@ async function runDemo() {
   // Summary Table Output
   // --------------------------------------------------------------------------
   console.log(bold('--- 1. THE 5-SCENARIO CHAOS MATRIX COMPARISON ---\n'));
-  console.log('='.repeat(108));
+  const sep = '='.repeat(146);
+  console.log(sep);
   console.log(
-    `| ${'#'.padEnd(2)} | ${'Scenario'.padEnd(28)} | ${'Chaos Fault'.padEnd(22)} | ${'Naive Result'.padEnd(22)} | ${'Hardened Result'.padEnd(22)} |`
+    `| ${'#'.padEnd(2)} | ${'Scenario'.padEnd(28)} | ${'Chaos Fault'.padEnd(26)} | ${'Naive Result'.padEnd(38)} | ${'Hardened Result'.padEnd(38)} |`
   );
-  console.log('='.repeat(108));
+  console.log(sep);
   for (const r of demoRows) {
     console.log(
-      `| ${String(r.num).padEnd(2)} | ${r.name.padEnd(28)} | ${r.fault.slice(0, 22).padEnd(22)} | ${r.naive.padEnd(31)} | ${r.hardened.padEnd(31)} |`
+      `| ${String(r.num).padEnd(2)} | ${r.name.padEnd(28)} | ${r.fault.padEnd(26)} | ${padAnsi(r.naive, 38)} | ${padAnsi(r.hardened, 38)} |`
     );
   }
-  console.log('='.repeat(108));
+  console.log(sep);
 
   // --------------------------------------------------------------------------
   // Timeline Table Sample Output

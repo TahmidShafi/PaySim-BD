@@ -1,6 +1,6 @@
 {
   "name": "paysim-bd",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Local CLI and chaos webhook simulator for bKash Tokenized Checkout and AWS SNS IPN",
   "type": "module",
   "main": "dist/index.js",

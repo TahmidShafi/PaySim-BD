@@ -191,6 +191,15 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
     const transitionRes = transitionPayment(payment.status as PaymentStatus, paymentAction);
     if (transitionRes.ok) {
       updatePaymentStatus(db, payment.payment_id, transitionRes.nextStatus, clock.nowMs());
+      if (transitionRes.nextStatus === 'APPROVED') {
+        insertEvent(db, {
+          ts: clock.nowMs(),
+          kind: 'WALLET_APPROVED',
+          payment_id: payment.payment_id,
+          request: JSON.stringify({ action, msisdn }),
+          response: JSON.stringify({ status: 'APPROVED' })
+        });
+      }
     }
 
     // Fire asynchronous HTTP GET request to callbackURL: <callbackURL>?paymentID=<id>&status=<status>
@@ -356,6 +365,14 @@ export function createSimulatorServer(options: SimulatorServerOptions): FastifyI
       };
 
       insertPayment(db, paymentRecord);
+
+      insertEvent(db, {
+        ts: now,
+        kind: 'PAYMENT_INITIATED',
+        payment_id: paymentId,
+        request: JSON.stringify(body),
+        response: JSON.stringify({ status: 'INITIATED', amount: body.amount })
+      });
 
       const host = req.headers.host ?? '127.0.0.1';
       const bkashURL = `http://${host}/_paysim/checkout/${paymentId}`;

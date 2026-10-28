@@ -5,6 +5,7 @@ import {
   claimDueOutboxRows,
   markOutboxDelivered,
   markOutboxRetry,
+  insertEvent,
   type ClaimedOutboxRow
 } from '../storage/repositories.js';
 
@@ -110,6 +111,13 @@ export class OutboxWorker {
 
       if (res.ok) {
         markOutboxDelivered(this.db, row.id, res.status);
+        insertEvent(this.db, {
+          ts: this.clock.nowMs(),
+          kind: 'IPN_DELIVERED',
+          payment_id: row.payment_id,
+          request: JSON.stringify({ url: row.callback_url, attempts: row.attempts }),
+          response: JSON.stringify({ httpStatus: res.status })
+        });
         if (this.eventEmitter) {
           this.eventEmitter.emit('ipn_delivered', row.payment_id);
         }
