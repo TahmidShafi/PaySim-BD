@@ -9,9 +9,16 @@ describe('Day 19: Compiled Build Asset & Dist Smoke Test', () => {
   let simDb: any;
 
   beforeAll(async () => {
-    // Assert dist/ output exists
     const distCertPath = path.resolve('dist/src/delivery/certs/test-cert.pem');
     const distKeyPath = path.resolve('dist/src/delivery/certs/test-key.pem');
+
+    // If dist/ has not been built yet, run build so the smoke test is fully self-contained
+    if (!fs.existsSync(distCertPath) || !fs.existsSync(distKeyPath)) {
+      const { execSync } = await import('node:child_process');
+      execSync('npm run build', { stdio: 'pipe' });
+    }
+
+    // Assert dist/ output exists
     expect(fs.existsSync(distCertPath)).toBe(true);
     expect(fs.existsSync(distKeyPath)).toBe(true);
 
@@ -35,8 +42,12 @@ describe('Day 19: Compiled Build Asset & Dist Smoke Test', () => {
   });
 
   afterAll(async () => {
-    await simApp.close();
-    simDb.close();
+    if (simApp) {
+      await simApp.close();
+    }
+    if (simDb) {
+      simDb.close();
+    }
   });
 
   it('serves the public X.509 cert from compiled dist without ENOENT error', async () => {

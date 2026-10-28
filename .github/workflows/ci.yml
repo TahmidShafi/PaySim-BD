@@ -31,11 +31,11 @@ jobs:
       - name: Typecheck TypeScript (tsc --noEmit)
         run: npx tsc --noEmit
 
-      - name: Run test suite (vitest)
-        run: npm test
-
       - name: Build production bundle & copy assets
         run: npm run build
+
+      - name: Run test suite (vitest)
+        run: npm test
 
       - name: Validate CLI entrypoint (--help)
         run: node dist/src/cli/index.js --help
